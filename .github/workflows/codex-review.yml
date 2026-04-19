@@ -1,0 +1,74 @@
+name: Codex Review
+
+# Триггеры:
+#   opened/synchronize/reopened — авто-ревью на каждый push в PR.
+#   labeled(codex-review)        — ручной on-demand re-review.
+# Форки и боты исключены (нет доступа к секретам).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  codex:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type != 'Bot' &&
+      (
+        contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) ||
+        (github.event.action == 'labeled' && github.event.label.name == 'codex-review')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+
+      - name: Codex review
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            Ревью PR в репозитории ${{ github.repository }}.
+            Если в репозитории есть AGENTS.md — прочитай его (правила и контекст проекта).
+
+            Diff: base ${{ github.event.pull_request.base.sha }} → head ${{ github.event.pull_request.head.sha }}.
+
+            Категории находок:
+            1. Критичные: баги, утечки секретов, SQL-инъекции, ломающие изменения API,
+               нарушения изоляции данных (multi-tenant / RLS).
+            2. Важные: нарушения правил из AGENTS.md (если есть), архитектурные проблемы,
+               дублирование, нарушения существующих паттернов проекта.
+            3. Стиль: any/unknown без обоснования, мёртвый код, нарушения conventional commits.
+
+            Формат: markdown. Для каждой находки — путь:строка, цитата, объяснение, фикс.
+            Если PR хороший — "✅ LGTM" с кратким резюме что проверил.
+            CI (lint/tests/build) не дублируй — фокусируйся на смысловой части.
+            Отвечай на русском, если AGENTS.md не указывает иначе.
+
+      - name: Post review
+        if: steps.codex.outputs.final-message != ''
+        uses: actions/github-script@v7
+        env:
+          CODEX_MESSAGE: ${{ steps.codex.outputs.final-message }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '### 🤖 Codex Review',
+                '',
+                process.env.CODEX_MESSAGE,
+                '',
+                '<sub>Автоматическое ревью от OpenAI Codex. Если не согласен — обоснуй в треде и поставь метку `needs-human`.</sub>'
+              ].join('\n')
+            });

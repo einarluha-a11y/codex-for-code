@@ -1,0 +1,8 @@
+[
+  { "name": "ai-ready",            "color": "0E8A16", "description": "Задача описана достаточно детально — Claude Code может взять автономно" },
+  { "name": "needs-human",         "color": "B60205", "description": "Требуется решение пользователя (эскалация из autonomous loop)" },
+  { "name": "human-approved",      "color": "0E8A16", "description": "Пользователь одобрил PR с меткой needs-human — Claude может мержить" },
+  { "name": "human-rejected",      "color": "B60205", "description": "Пользователь отклонил PR с меткой needs-human — Claude не мержит" },
+  { "name": "approval-flow-error", "color": "FBCA04", "description": "Технический сбой approve-workflow — НЕ reject пользователя; перезапусти approval" },
+  { "name": "codex-review",        "color": "5319E7", "description": "Триггер Codex review workflow on-demand" }
+]

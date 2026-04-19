@@ -1,0 +1,62 @@
+name: Needs-Human Rejected
+
+# Срабатывает когда Needs-Human Approval завершился НЕ-успехом.
+#   failure / timed_out → реальный reject пользователя или истечение 7 дней
+#                         → ставим `human-rejected`.
+#   cancelled / прочее   → технический сбой → ставим `approval-flow-error`
+#                         (чтобы не блокировать PR ложным reject).
+
+on:
+  workflow_run:
+    workflows: ["Needs-Human Approval"]
+    types: [completed]
+
+jobs:
+  handle-non-success:
+    if: github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const prs = run.pull_requests || [];
+            if (prs.length === 0) {
+              core.info(`No PR linked to run ${run.id}, skip.`);
+              return;
+            }
+            const pr = prs[0].number;
+            const conclusion = run.conclusion;
+            const isReject = conclusion === 'failure' || conclusion === 'timed_out';
+            core.info(`PR #${pr}: conclusion=${conclusion}, isReject=${isReject}`);
+
+            if (isReject) {
+              for (const lbl of ['needs-human', 'human-approved']) {
+                await github.rest.issues.removeLabel({
+                  ...context.repo, issue_number: pr, name: lbl,
+                }).catch(() => {});
+              }
+              await github.rest.issues.addLabels({
+                ...context.repo, issue_number: pr, labels: ['human-rejected'],
+              });
+              const reason = conclusion === 'failure'
+                ? 'отклонено пользователем в GitHub Environment review'
+                : 'не принято за 7 дней (timed_out)';
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: pr,
+                body: `❌ Approval ${reason}. Метка \`human-rejected\` поставлена. Claude Code не будет мержить — закрой/обнови вручную.`
+              });
+            } else {
+              // Технический сбой: НЕ блокируем PR меткой rejected.
+              await github.rest.issues.addLabels({
+                ...context.repo, issue_number: pr, labels: ['approval-flow-error'],
+              }).catch((e) => core.warning(`addLabels failed: ${e.message}`));
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: pr,
+                body: `⚠️ Workflow approval-петли завершился со статусом \`${conclusion}\` (техсбой, не reject пользователя). Метка \`needs-human\` оставлена. Перезапусти approval вручную: сними и снова поставь метку \`needs-human\`.`
+              });
+            }

@@ -1,0 +1,43 @@
+name: Needs-Human Approval
+
+# Метка `needs-human` от Claude → этот workflow паузится в environment
+# `human-approval` (required reviewer = einarluha-a11y) → GitHub шлёт email
+# с кнопкой Review deployments. Approve → метки перещёлкиваются.
+# Reject/timeout/cancel обрабатывает needs-human-rejected.yml через workflow_run.
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  await-approval:
+    if: github.event.label.name == 'needs-human'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10080  # 7 дней
+    permissions:
+      pull-requests: write
+      contents: read
+    environment:
+      name: human-approval
+      url: ${{ github.event.pull_request.html_url }}
+
+    steps:
+      - name: Approved — flip labels and comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request.number;
+            // Снимаем все pending-метки approve-петли — иначе PR может
+            // остаться с human-approved + human-rejected одновременно.
+            for (const lbl of ['needs-human', 'human-rejected']) {
+              await github.rest.issues.removeLabel({
+                ...context.repo, issue_number: pr, name: lbl,
+              }).catch(() => {});
+            }
+            await github.rest.issues.addLabels({
+              ...context.repo, issue_number: pr, labels: ['human-approved'],
+            });
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number: pr,
+              body: `✅ Human approval получен от @${context.actor}. Метка \`needs-human\` снята, поставлена \`human-approved\`. Claude Code продолжит автономно.`
+            });
