@@ -7,6 +7,8 @@
   PR_CLOSED #N                           — PR закрыт/мерджен
   PR_COMMENT #N by <user> [id=<id>]: <body>
   PR_CI #N | <name1=STATE,name2=STATE,...>
+  PR_REVIEW #N | <APPROVED|CHANGES_REQUESTED|REVIEW_REQUIRED|(none)>
+                                         — изменилось решение ревью
   PR_LABELS #N | <label1,label2,...>     — изменился набор меток
                                            (используется для needs-human /
                                            human-approved / human-rejected
@@ -44,8 +46,16 @@ REPO = (
 )
 INTERVAL = int(os.environ.get("INTERVAL", "30"))
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
+# Потолок множеств анти-спама: сброс лучше неограниченного роста в процессе,
+# который живёт сутками.
+_WARN_CAP = 1000
 _WARNED_CREATED_AT = set()
 _WARNED_COMMENT_ID_COLLISIONS = set()
+# Оба значения гасят «тихую слепоту» на пагинации: gh отдаёт 30 элементов по
+# умолчанию и молча теряет остальное. per_page=100 экономит запросы (watcher
+# опрашивает каждые INTERVAL секунд), --paginate добирает хвост.
+_PER_PAGE = 100
+_PR_LIMIT = 200
 
 
 class GhError(Exception):
@@ -100,10 +110,17 @@ def gh_json(args):
 def list_open_prs():
     """ВАЖНО: при ошибке кидает GhError. Пустой [] — это легитимно
     (PR'ов нет), не путать с ошибкой. Иначе watcher ложно эмитил бы
-    PR_CLOSED для всех known PR при rate-limit / network glitch."""
+    PR_CLOSED для всех known PR при rate-limit / network glitch.
+
+    --limit обязателен: без него gh отдаёт 30 PR и остальные для watcher'а
+    просто не существуют. reviewDecision берётся здесь же — отдельный
+    запрос к /pulls/{n}/reviews стоил бы ещё одного вызова на КАЖДЫЙ PR в
+    КАЖДОМ опросе, а решение ревью доступно полем в уже делаемом запросе.
+    """
     return gh_json(
         ["pr", "list", "--repo", REPO, "--state", "open",
-         "--json", "number,title,labels"]
+         "--limit", str(_PR_LIMIT),
+         "--json", "number,title,labels,reviewDecision"]
     )
 
 
@@ -111,6 +128,39 @@ def labels_str(pr_obj):
     """Стабильное строковое представление набора меток для diff."""
     names = sorted(l.get("name", "") for l in (pr_obj.get("labels") or []))
     return ",".join(names)
+
+
+def emit(line):
+    # Один print = одно событие. flush обязателен — без него Monitor не видит.
+    print(line, flush=True)
+
+
+def _norm_id_key(raw_id):
+    """Однородный тай-брейк для любого id, включая отсутствующий.
+
+    Прямое c["id"] роняло watcher на объекте без поля, а сравнение int
+    против str при равных датах давало TypeError. Числовые id идут раньше
+    нечисловых и не схлопываются в одно значение.
+    """
+    try:
+        return (0, int(raw_id))
+    except Exception:
+        return (1, str(raw_id))
+
+
+def _remember_warning(warned, key):
+    """True, если про этот ключ ещё не предупреждали.
+
+    Watcher опрашивает GitHub каждые INTERVAL секунд: без памяти одно
+    битое значение дало бы поток одинаковых строк в чате владельца.
+    """
+    if key in warned:
+        return False
+    if len(warned) >= _WARN_CAP:
+        # Редкий повтор после сброса дешевле неограниченного роста.
+        warned.clear()
+    warned.add(key)
+    return True
 
 
 def comment_key(c):
@@ -125,23 +175,31 @@ def comment_key(c):
     """
     s = c.get("created_at") or ""
     if not s:
-        return (_EPOCH, c["id"])
+        return (_EPOCH, _norm_id_key(c.get("id")))
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             # GitHub отдаёт UTC; aware обязателен для сравнения с watermark.
             dt = dt.replace(tzinfo=timezone.utc)
-        return (dt, c["id"])
-    except Exception:
+        return (dt, _norm_id_key(c.get("id")))
+    except Exception as e:
         # ШИРОКО намеренно: сюда попадает и смена типа поля в API
         # (не-строка → AttributeError на .replace). Падение watcher'а =
         # тихая остановка всей петли, что хуже деградации одного ключа.
         # Ключ анти-спама — строка: сырое значение может быть нехешируемым.
         warn_key = str(s)[:40]
-        if warn_key not in _WARNED_CREATED_AT:
-            _WARNED_CREATED_AT.add(warn_key)
-            emit(f"WATCH_ERROR comment_key: unparsable created_at={warn_key}")
-        return (_EPOCH, c["id"])
+        if _remember_warning(_WARNED_CREATED_AT, warn_key):
+            err = f"{type(e).__name__}: {e}"[:60]
+            emit(
+                f"WATCH_ERROR comment_key: unparsable created_at={warn_key} "
+                f"err={err}"
+            )
+        return (_EPOCH, _norm_id_key(c.get("id")))
+
+
+def _comments_path(kind, pr):
+    """Путь к ленте комментариев PR. kind: issues | pulls."""
+    return f"repos/{REPO}/{kind}/{pr}/comments?per_page={_PER_PAGE}"
 
 
 def list_comments(pr):
@@ -152,18 +210,24 @@ def list_comments(pr):
     Инвариант непересечения эндпоинтов проверяется в рантайме: коллизия
     вызывает громкое предупреждение, но не дедуп — он мог бы потерять
     легитимный комментарий из другого id-пространства.
+
+    Лента обязательно полная (--paginate): GitHub отдаёт страницами по
+    возрастанию даты, поэтому без пагинации watcher на PR с числом
+    комментариев больше страницы видел бы только САМЫЕ СТАРЫЕ, ставил
+    watermark по ним и молча переставал эмитить новые.
     """
-    issues = gh_json(["api", f"repos/{REPO}/issues/{pr}/comments"])
-    reviews = gh_json(["api", f"repos/{REPO}/pulls/{pr}/comments"])
-    collisions = {c["id"] for c in issues} & {c["id"] for c in reviews}
-    new_collisions = sorted(
-        collision for collision in collisions
-        if (pr, collision) not in _WARNED_COMMENT_ID_COLLISIONS
-    )
+    issues = gh_json(["api", "--paginate", _comments_path("issues", pr)])
+    reviews = gh_json(["api", "--paginate", _comments_path("pulls", pr)])
+    # В детект коллизий идут только валидные числовые id: отсутствующий id
+    # не образует коллизии, а c["id"] дал бы KeyError мимо GhError —
+    # вызывающий код ловит только его, и watcher упал бы целиком.
+    issue_ids = {c.get("id") for c in issues if isinstance(c.get("id"), int)}
+    review_ids = {c.get("id") for c in reviews if isinstance(c.get("id"), int)}
+    new_collisions = [
+        collision for collision in sorted(issue_ids & review_ids)
+        if _remember_warning(_WARNED_COMMENT_ID_COLLISIONS, (pr, collision))
+    ]
     if new_collisions:
-        _WARNED_COMMENT_ID_COLLISIONS.update(
-            (pr, collision) for collision in new_collisions
-        )
         shown = ",".join(str(collision) for collision in new_collisions[:3])
         emit(
             f"WATCH_ERROR list_comments #{pr}: "
@@ -194,9 +258,9 @@ def ci_status(pr):
     return ",".join(pairs)
 
 
-def emit(line):
-    # Один print = одно событие. flush обязателен — без него Monitor не видит.
-    print(line, flush=True)
+def review_str(pr_obj):
+    """Решение ревью: APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED / ""."""
+    return pr_obj.get("reviewDecision") or ""
 
 
 def snapshot(prs):
@@ -206,9 +270,13 @@ def snapshot(prs):
         n = pr["number"]
         cs = list_comments(n)
         known[n] = {
-            "last_comment_key": max((comment_key(c) for c in cs), default=(_EPOCH, 0)),
+            "last_comment_key": max(
+                (comment_key(c) for c in cs),
+                default=(_EPOCH, _norm_id_key(0)),
+            ),
             "ci": ci_status(n),
             "labels": labels_str(pr),
+            "review": review_str(pr),
         }
     return known
 
@@ -275,10 +343,12 @@ def main():
                     cs = []
                 known[n] = {
                     "last_comment_key": max(
-                        (comment_key(c) for c in cs), default=(_EPOCH, 0)
+                        (comment_key(c) for c in cs),
+                        default=(_EPOCH, _norm_id_key(0)),
                     ),
                     "ci": "",
                     "labels": labels_str(current_by_num[n]),
+                    "review": review_str(current_by_num[n]),
                 }
 
         # Закрытые (только если list_open_prs() реально успешно отработал)
@@ -296,6 +366,13 @@ def main():
                 emit(f"PR_LABELS #{n} | {cur_labels or '(none)'}")
                 state["labels"] = cur_labels
 
+            # Решение ревью (approve / request changes) — из уже полученного
+            # списка PR, без отдельного запроса на каждый PR.
+            cur_review = review_str(current_by_num[n])
+            if cur_review != state.get("review", ""):
+                emit(f"PR_REVIEW #{n} | {cur_review or '(none)'}")
+                state["review"] = cur_review
+
             try:
                 cs = list_comments(n)
                 last = state["last_comment_key"]
@@ -303,11 +380,22 @@ def main():
                 if new:
                     # cs уже отсортирован comment_key'ем в list_comments.
                     for c in new:
-                        author = c["user"]["login"]
-                        body = (c["body"] or "").replace("\n", " ").replace("\r", " ")
+                        # Безопасное извлечение: KeyError здесь не GhError и
+                        # пролетел бы мимо except ниже, уронив весь watcher.
+                        user = c.get("user")
+                        if not isinstance(user, dict):
+                            user = {}
+                        author = user.get("login") or "?"
+                        body = c.get("body") or ""
+                        if not isinstance(body, str):
+                            body = str(body)
+                        body = body.replace("\n", " ").replace("\r", " ")
                         if len(body) > 200:
                             body = body[:200] + "…"
-                        emit(f"PR_COMMENT #{n} by {author} [id={c['id']}]: {body}")
+                        emit(
+                            f"PR_COMMENT #{n} by {author} "
+                            f"[id={c.get('id')}]: {body}"
+                        )
                     state["last_comment_key"] = max(comment_key(c) for c in cs)
             except GhError as e:
                 emit(f"WATCH_ERROR comments #{n}: {e}")
@@ -361,15 +449,19 @@ def self_test():
         check("naive", naive_key[0].tzinfo is not None
               and naive_key[0] > _EPOCH)
 
-        check("empty", comment_key(empty) == (_EPOCH, 5))
+        check("empty", comment_key(empty) == (_EPOCH, _norm_id_key(5)))
 
         before = len(captured)
         broken_key = comment_key(broken)
         comment_key(broken)
         warnings = captured[before:]
-        check("unparsable", broken_key == (_EPOCH, 6)
+        check("unparsable", broken_key == (_EPOCH, _norm_id_key(6))
               and len(warnings) == 1
               and warnings[0].startswith("WATCH_ERROR comment_key:"))
+
+        # Диагностика в предупреждении: без типа/текста исключения непонятно,
+        # ЧЕМ именно не понравилось значение.
+        check("unparsable-diagnostic", "err=" in warnings[0])
 
         # Смена типа поля в API: .replace() на не-строке даёт AttributeError,
         # а нехешируемое значение уронило бы ещё и анти-спам-множество.
@@ -380,9 +472,23 @@ def self_test():
         unhashable_key = comment_key(unhashable)
         comment_key(wrong_type)
         warnings = captured[before:]
-        check("wrong-type", wrong_type_key == (_EPOCH, 7)
-              and unhashable_key == (_EPOCH, 8)
+        check("wrong-type", wrong_type_key == (_EPOCH, _norm_id_key(7))
+              and unhashable_key == (_EPOCH, _norm_id_key(8))
               and len(warnings) == 2)
+
+        # Объект без id: прямое c["id"] роняло бы watcher на первом же
+        # изменении формата ответа.
+        missing_id_key = comment_key({"created_at": ""})
+        check("missing-id", missing_id_key == (_EPOCH, _norm_id_key(None))
+              and missing_id_key < comment_key(plain))
+
+        # Разные типы id при РАВНЫХ датах: голое сравнение int против str
+        # даёт TypeError и валит сортировку всей ленты.
+        same_date_int = {"id": 42, "created_at": "2026-08-20T12:34:56Z"}
+        same_date_text = {"id": "abc", "created_at": "2026-08-20T12:34:56Z"}
+        check("nonnumeric-id-order",
+              [c.get("id") for c in sorted([same_date_text, same_date_int],
+                                           key=comment_key)] == [42, "abc"])
 
         mixed = [plain, fractional, offset, naive, broken, empty]
         ordered = sorted(mixed, key=comment_key)
@@ -391,7 +497,15 @@ def self_test():
                                 and key[0].tzinfo is not None for key in keys)
               and [c["id"] for c in ordered] == [5, 6, 1, 3, 4, 2])
 
-        check("watermark", all(comment_key(c) > (_EPOCH, 0) for c in mixed))
+        check("watermark",
+              all(comment_key(c) > (_EPOCH, _norm_id_key(0)) for c in mixed))
+
+        # Анти-спам не имеет права расти без границы в процессе, который
+        # живёт сутками.
+        _WARNED_CREATED_AT.clear()
+        for i in range(_WARN_CAP + 10):
+            comment_key({"id": i, "created_at": f"broken-{i}"})
+        check("warning-cap", len(_WARNED_CREATED_AT) <= _WARN_CAP)
 
         issue_collision = [
             {"id": 10, "created_at": "2026-08-20T12:00:00Z"},
@@ -401,8 +515,15 @@ def self_test():
             {"id": 10, "created_at": "2026-08-20T12:01:00Z"},
         ]
 
+        def _is_issues(args):
+            """Признак эндпоинта, не зависящий от позиции пути и query."""
+            return "issues" in args[-1].split("?")[0].split("/")
+
+        calls = []
+
         def collision_gh(args):
-            return issue_collision if "/issues/" in args[1] else review_collision
+            calls.append(args)
+            return issue_collision if _is_issues(args) else review_collision
 
         globals()["gh_json"] = collision_gh
         before = len(captured)
@@ -413,17 +534,49 @@ def self_test():
               and len(warnings) == 1
               and warnings[0].startswith("WATCH_ERROR list_comments #7:"))
 
+        # Регресс-защита: без --paginate watcher видит только первую
+        # страницу (самые СТАРЫЕ комментарии) и молча слепнет на активном PR.
+        check("pagination",
+              bool(calls)
+              and all("--paginate" in args for args in calls)
+              and all(f"per_page={_PER_PAGE}" in args[-1] for args in calls))
+
         issue_clean = [{"id": 30, "created_at": "2026-08-20T12:02:00Z"}]
         review_clean = [{"id": 40, "created_at": "2026-08-20T12:01:00Z"}]
 
         def clean_gh(args):
-            return issue_clean if "/issues/" in args[1] else review_clean
+            return issue_clean if _is_issues(args) else review_clean
 
         globals()["gh_json"] = clean_gh
         before = len(captured)
         clean_feed = list_comments(8)
         check("no-collision", captured[before:] == []
               and [c["id"] for c in clean_feed] == [40, 30])
+
+        # Объекты без id в ленте: детект коллизий обязан их игнорировать,
+        # а не падать KeyError мимо GhError.
+        issue_missing = [
+            {"created_at": "2026-08-20T12:00:00Z"},
+            {"id": 50, "created_at": "2026-08-20T12:02:00Z"},
+        ]
+        review_missing = [
+            {"created_at": "2026-08-20T12:01:00Z"},
+            {"id": 60, "created_at": "2026-08-20T12:03:00Z"},
+        ]
+
+        def missing_gh(args):
+            return issue_missing if _is_issues(args) else review_missing
+
+        globals()["gh_json"] = missing_gh
+        before = len(captured)
+        missing_feed = list_comments(9)
+        check("missing-id-feed",
+              len(missing_feed) == 4 and captured[before:] == [])
+
+        check("review-decision",
+              review_str({"reviewDecision": "APPROVED"}) == "APPROVED"
+              and review_str({"reviewDecision": None}) == ""
+              and review_str({}) == "")
 
         # Инцидент claude-control-center: ОДИН PR без чеков ронял snapshot()
         # целиком → bootstrapped=False, known пуст, отслеживание ВСЕХ PR
