@@ -52,6 +52,23 @@ class GhError(Exception):
     """Ошибка вызова gh CLI (network/rate-limit/auth/timeout)."""
 
 
+class GhNoChecks(GhError):
+    """У ветки PR нет НИ ОДНОЙ проверки.
+
+    `gh pr checks` в этом случае выходит с exit=1 и пишет в stderr
+    'no checks reported on the '<branch>' branch' — это не сбой gh, а
+    легитимное состояние (workflow ещё не поставлен в очередь / нет
+    воркфлоу на путях ветки). Подкласс GhError намеренно: код, который
+    ловит GhError, ведёт себя как раньше; деградацию включает только тот,
+    кто ЯВНО ловит GhNoChecks (ci_status). Настоящие сбои gh
+    (rate-limit/auth/network) под этот класс не попадают и не маскируются.
+    """
+
+
+# Строка формата gh: "no checks reported on the '%s' branch" (cli/cli).
+_NO_CHECKS_STDERR = "no checks reported"
+
+
 def gh(args):
     """Вызов gh. Возвращает stdout. Кидает GhError при сбое."""
     try:
@@ -62,7 +79,10 @@ def gh(args):
     except Exception as e:
         raise GhError(f"subprocess: {e}")
     if out.returncode != 0:
-        raise GhError(f"exit={out.returncode}: {out.stderr.strip()[:160]}")
+        stderr = out.stderr.strip()
+        if _NO_CHECKS_STDERR in stderr.lower():
+            raise GhNoChecks(f"exit={out.returncode}: {stderr[:160]}")
+        raise GhError(f"exit={out.returncode}: {stderr[:160]}")
     return out.stdout.strip()
 
 
@@ -153,10 +173,23 @@ def list_comments(pr):
 
 
 def ci_status(pr):
-    raw = gh_json(
-        ["pr", "checks", str(pr), "--repo", REPO,
-         "--json", "name,state"]
-    )
+    """Строка состояния проверок PR; "" = проверок нет.
+
+    PR без единой проверки — НЕ ошибка: деградируем до "" (ровно тот же
+    смысл, что у только что открытого PR в main()) — иначе один такой PR
+    ронял бы snapshot() целиком и откладывал bootstrap отслеживания ВСЕХ
+    остальных PR минимум на INTERVAL (инцидент claude-control-center:
+    'WATCH_ERROR init: exit=1: no checks reported on the ... branch').
+    Прочие сбои gh пробрасываются GhError — маскировать rate-limit/auth
+    нельзя: watcher замолчал бы, выглядя работающим.
+    """
+    try:
+        raw = gh_json(
+            ["pr", "checks", str(pr), "--repo", REPO,
+             "--json", "name,state"]
+        )
+    except GhNoChecks:
+        return ""
     pairs = sorted(f"{c['name']}={c['state']}" for c in raw)
     return ",".join(pairs)
 
@@ -296,6 +329,7 @@ def self_test():
     captured = []
     original_emit = globals()["emit"]
     original_gh_json = globals()["gh_json"]
+    original_subprocess = globals()["subprocess"]
 
     def check(name, condition):
         results.append((name, bool(condition)))
@@ -390,11 +424,74 @@ def self_test():
         clean_feed = list_comments(8)
         check("no-collision", captured[before:] == []
               and [c["id"] for c in clean_feed] == [40, 30])
+
+        # Инцидент claude-control-center: ОДИН PR без чеков ронял snapshot()
+        # целиком → bootstrapped=False, known пуст, отслеживание ВСЕХ PR
+        # откладывалось минимум на INTERVAL.
+        def snapshot_gh(args):
+            if args[0] == "pr" and args[1] == "checks":
+                if args[2] == "2":
+                    raise GhNoChecks(
+                        "exit=1: no checks reported on the 'topic' branch"
+                    )
+                return [{"name": "codex", "state": "SUCCESS"}]
+            return []
+
+        globals()["gh_json"] = snapshot_gh
+        snap = snapshot([{"number": 1, "labels": []}, {"number": 2, "labels": []}])
+        check("snapshot-survives-no-checks",
+              set(snap) == {1, 2}
+              and snap[1]["ci"] == "codex=SUCCESS"
+              and snap[2]["ci"] == "")
+
+        # Классификация stderr — на уровне gh(), с настоящим gh_json.
+        globals()["gh_json"] = original_gh_json
+
+        class _Result:
+            def __init__(self, returncode, stdout, stderr):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+
+        class _FakeSubprocess:
+            """Подменяет ТОЛЬКО subprocess.run в gh(): без сети и без gh CLI."""
+
+            def __init__(self, result):
+                self._result = result
+
+            def run(self, *_args, **_kwargs):
+                return self._result
+
+        globals()["subprocess"] = _FakeSubprocess(
+            _Result(1, "", "no checks reported on the 'topic' branch\n")
+        )
+        no_checks_error = None
+        try:
+            gh(["pr", "checks", "1", "--repo", REPO, "--json", "name,state"])
+        except GhError as e:
+            no_checks_error = e
+        check("no-checks-classified", isinstance(no_checks_error, GhNoChecks))
+        check("no-checks-degrades", ci_status(1) == "")
+
+        # Настоящий сбой gh не имеет права превратиться в пустой CI: иначе
+        # rate-limit/auth выглядели бы как "проверок нет" и watcher молчал.
+        globals()["subprocess"] = _FakeSubprocess(
+            _Result(1, "", "API rate limit exceeded for user ID 1")
+        )
+        rate_limit_error = None
+        try:
+            ci_status(1)
+        except GhError as e:
+            rate_limit_error = e
+        check("gh-error-not-masked",
+              isinstance(rate_limit_error, GhError)
+              and not isinstance(rate_limit_error, GhNoChecks))
     except Exception as e:
         results.append((f"unexpected: {type(e).__name__}: {e}", False))
     finally:
         globals()["emit"] = original_emit
         globals()["gh_json"] = original_gh_json
+        globals()["subprocess"] = original_subprocess
 
     failed = [name for name, ok in results if not ok]
     total = len(results)
