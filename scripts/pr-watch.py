@@ -214,6 +214,32 @@ def list_open_prs():
             f"{_PR_LIMIT} — список мог быть усечён, PR сверх лимита "
             f"не отслеживаются"
         )
+    return _validated_prs(prs)
+
+
+def _validated_prs(prs):
+    """Проверка формы ответа — целиком, а не поэлементно.
+
+    Ниже по коду номер берётся прямым `pr["number"]`, и промах поднял бы
+    KeyError, который НЕ ловится `except GhError` и убил бы весь watcher,
+    а не один PR.
+
+    Отбрасывать кривую запись при этом нельзя: пропущенный PR неотличим от
+    закрытого, и следующий шаг цикла соврал бы `PR_CLOSED`. По той же
+    причине нельзя вернуть частичный список. Поэтому любая неожиданная
+    запись превращает ВЕСЬ опрос в GhError: событий не будет, но и ложных
+    тоже — вызывающий уже умеет пережить неудачный опрос.
+    """
+    if not isinstance(prs, list):
+        raise GhError(
+            f"форма ответа: ожидался список PR, пришло {type(prs).__name__}"
+        )
+    for pr in prs:
+        num = pr.get("number") if isinstance(pr, dict) else None
+        if not isinstance(num, int) or isinstance(num, bool):
+            raise GhError(
+                "форма ответа: запись PR без числового поля number"
+            )
     return prs
 
 
@@ -972,6 +998,45 @@ def self_test():
         except GhError as e:
             raised = e
         check("json-truncated-raises", isinstance(raised, GhError))
+
+        # --- форма списка PR: номер обязан быть числом ---
+        good = [{"number": 1, "title": "a"}, {"number": 2, "title": "b"}]
+        check("pr-shape-passthrough", _validated_prs(good) == good)
+
+        def rejects(value):
+            try:
+                _validated_prs(value)
+            except GhError:
+                return True
+            return False
+
+        # Каждый случай убил бы watcher на прямом pr["number"].
+        check("pr-shape-missing-number", rejects([{"title": "нет номера"}]))
+        check("pr-shape-string-number", rejects([{"number": "7"}]))
+        check("pr-shape-bool-number", rejects([{"number": True}]))
+        check("pr-shape-not-dict", rejects(["не словарь"]))
+        check("pr-shape-not-list", rejects({"number": 1}))
+
+        # Пустой список легитимен: PR'ов просто нет.
+        check("pr-shape-empty-ok", _validated_prs([]) == [])
+
+        # Кривая запись НЕ имеет права стать частичным списком: пропущенный
+        # PR неотличим от закрытого, и watcher соврал бы PR_CLOSED.
+        mixed = [{"number": 1}, {"title": "кривая"}, {"number": 3}]
+        check("pr-shape-no-partial", rejects(mixed))
+
+        # Проверки выше доказывают ЛОГИКУ валидатора, но проходят и тогда,
+        # когда он не вызывается из list_open_prs (проверено откатом).
+        # Поэтому отдельно доказываем ПРОВОДКУ — иначе это ровно тот случай,
+        # когда механизм построен, выглядит рабочим и ни к чему не подключён.
+        globals()["_review_field_supported"] = True
+        globals()["gh_json"] = lambda _args: [{"title": "без номера"}]
+        wired = None
+        try:
+            list_open_prs()
+        except GhError as e:
+            wired = e
+        check("pr-shape-wired-into-list-prs", isinstance(wired, GhError))
     except Exception as e:
         results.append((f"unexpected: {type(e).__name__}: {e}", False))
     finally:
