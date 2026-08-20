@@ -53,6 +53,8 @@ _WARNED_CREATED_AT = set()
 _WARNED_COMMENT_ID_COLLISIONS = set()
 _WARNED_PR_LIMIT = set()
 _WARNED_CI_SHAPE = set()
+_WARNED_JSON_SHAPE = set()
+_WARNED_PR_MISSING = set()
 # Оба значения гасят «тихую слепоту» на пагинации: gh отдаёт 30 элементов по
 # умолчанию и молча теряет остальное. per_page=100 экономит запросы (watcher
 # опрашивает каждые INTERVAL секунд), --paginate добирает хвост.
@@ -121,15 +123,55 @@ def gh(args):
     return out.stdout.strip()
 
 
+def _parse_ndjson(raw):
+    """Построчный разбор по принципу «всё или ничего».
+
+    Возвращает список элементов либо None, если хотя бы одна непустая строка
+    не разобралась. None означает «это не построчный JSON» — вызывающий
+    поднимет ИСХОДНУЮ ошибку разбора.
+
+    Частичный разбор здесь опаснее падения: watcher посчитал бы watermark по
+    куску ленты и молча перестал бы эмитить новые события.
+    """
+    items = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except Exception:
+            return None
+        if isinstance(parsed, list):
+            items.extend(parsed)
+        else:
+            items.append(parsed)
+    return items or None
+
+
 def gh_json(args):
-    """Вызов gh + parse JSON. Кидает GhError при сбое."""
+    """Вызов gh + parse JSON. Кидает GhError при сбое.
+
+    gh 2.83 склеивает страницы `--paginate` в ОДИН валидный массив (проверено:
+    3014 элементов приходят одной строкой), поэтому основной путь — обычный
+    разбор. Запасной путь на случай смены формата в будущих версиях gh:
+    построчный JSON по принципу «всё или ничего». Без него смена формата дала
+    бы GhError на КАЖДОМ опросе — watcher громко жалуется и при этом мёртв,
+    ровно тот класс, что уже закрыт фолбэком для отсутствующего reviewDecision.
+    """
     raw = gh(args)
     if not raw:
         return []
     try:
         return json.loads(raw)
     except Exception as e:
-        raise GhError(f"json: {e}")
+        items = _parse_ndjson(raw)
+        if items is None:
+            raise GhError(f"json: {e}")
+        if _remember_warning(_WARNED_JSON_SHAPE, args[0] if args else "?"):
+            emit("WATCH_ERROR json: gh отдал построчный JSON вместо одного "
+                 "массива — формат вывода изменился, разобрано построчно")
+        return items
 
 
 def list_open_prs():
@@ -454,15 +496,27 @@ def main():
         # Для каждого активного PR: новые комменты + изменения CI + метки.
         # Ошибки на конкретном PR не должны валить всю петлю.
         for n, state in list(known.items()):
+            # Снятие закрытых выше делает known подмножеством current_by_num,
+            # так что промах ключа сейчас невозможен. Страховка нужна на случай
+            # будущей правки порядка шагов: KeyError не ловится `except GhError`
+            # ниже и убил бы ВЕСЬ watcher, а не один PR. Пропускаем громко —
+            # тихий пропуск неотличим от «событий не было».
+            pr_obj = current_by_num.get(n)
+            if pr_obj is None:
+                if _remember_warning(_WARNED_PR_MISSING, n):
+                    emit(f"WATCH_ERROR #{n}: PR отсутствует в снимке — "
+                         f"пропущен на этой итерации")
+                continue
+
             # Labels diff (для needs-human / human-approved / human-rejected).
-            cur_labels = labels_str(current_by_num[n])
+            cur_labels = labels_str(pr_obj)
             if cur_labels != state["labels"]:
                 emit(f"PR_LABELS #{n} | {cur_labels or '(none)'}")
                 state["labels"] = cur_labels
 
             # Решение ревью (approve / request changes) — из уже полученного
             # списка PR, без отдельного запроса на каждый PR.
-            cur_review = review_str(current_by_num[n])
+            cur_review = review_str(pr_obj)
             if cur_review != state.get("review", ""):
                 emit(f"PR_REVIEW #{n} | {cur_review or '(none)'}")
                 state["review"] = cur_review
@@ -871,6 +925,53 @@ def self_test():
               isinstance(propagated, GhError)
               and len(retry_calls) == 1
               and globals()["_review_field_supported"] is True)
+
+        # --- форма ответа gh: один массив, построчный JSON, обрыв ---
+        globals()["gh_json"] = original_gh_json
+
+        # Основной путь: gh 2.83 отдаёт ОДИН валидный массив.
+        check("json-single-array",
+              _parse_ndjson('[{"id": 1}, {"id": 2}]') == [{"id": 1},
+                                                          {"id": 2}])
+
+        # Смена формата: построчный JSON собирается в общий список.
+        check("json-ndjson-merged",
+              _parse_ndjson('{"id": 1}\n{"id": 2}') == [{"id": 1}, {"id": 2}])
+        check("json-ndjson-arrays-flattened",
+              _parse_ndjson('[{"id": 1}]\n[{"id": 2}]') == [{"id": 1},
+                                                            {"id": 2}])
+
+        # Обрыв на середине НЕ имеет права разобраться частично: половина
+        # ленты дала бы watermark по куску и молчание вместо событий.
+        check("json-truncated-rejected",
+              _parse_ndjson('{"id": 1}\n{"id": 2') is None)
+        check("json-garbage-rejected", _parse_ndjson("не json") is None)
+        check("json-empty-rejected", _parse_ndjson("\n  \n") is None)
+
+        # gh_json на построчном ответе: разбирает и предупреждает ОДИН раз.
+        _WARNED_JSON_SHAPE.clear()
+        globals()["subprocess"] = _FakeSubprocess(
+            _Result(0, '{"id": 1}\n{"id": 2}', ""))
+        before = len(captured)
+        ndjson_result = gh_json(["api", "x"])
+        first_warned = len(captured) - before
+        ndjson_again = gh_json(["api", "x"])
+        second_warned = len(captured) - before - first_warned
+        check("json-ndjson-warns-once",
+              ndjson_result == [{"id": 1}, {"id": 2}]
+              and ndjson_again == ndjson_result
+              and first_warned == 1
+              and second_warned == 0)
+
+        # Обрыв поднимает ИСХОДНУЮ ошибку разбора, а не тихий частичный список.
+        globals()["subprocess"] = _FakeSubprocess(
+            _Result(0, '{"id": 1}\n{"id": 2', ""))
+        raised = None
+        try:
+            gh_json(["api", "x"])
+        except GhError as e:
+            raised = e
+        check("json-truncated-raises", isinstance(raised, GhError))
     except Exception as e:
         results.append((f"unexpected: {type(e).__name__}: {e}", False))
     finally:
