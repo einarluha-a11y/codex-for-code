@@ -11,10 +11,13 @@
                                            (используется для needs-human /
                                            human-approved / human-rejected
                                            approve-петли, см. docs/ai-workflow.md §6.1)
+  WATCH_STOPPED repo=<repo> signal=<signal>
 """
 import json
 import os
+import signal
 import subprocess
+import sys
 import time
 
 
@@ -83,9 +86,15 @@ def labels_str(pr_obj):
 
 
 def list_comments(pr):
-    return gh_json(
-        ["api", f"repos/{REPO}/issues/{pr}/comments"]
-    )
+    """Issue-comments + pull-review-comments одной лентой.
+
+    СТРОГО: сбой любого из двух эндпоинтов = GhError всей функции —
+    частичная лента сдвинула бы watermark по неполным данным.
+    """
+    issues = gh_json(["api", f"repos/{REPO}/issues/{pr}/comments"])
+    reviews = gh_json(["api", f"repos/{REPO}/pulls/{pr}/comments"])
+    combined = {c["id"]: c for c in issues + reviews}
+    return [combined[k] for k in sorted(combined)]
 
 
 def ci_status(pr):
@@ -102,21 +111,38 @@ def emit(line):
     print(line, flush=True)
 
 
+def snapshot(prs):
+    """Снимок текущего состояния PR без эмита истории."""
+    known = {}
+    for pr in prs:
+        n = pr["number"]
+        cs = list_comments(n)
+        max_id = max((c["id"] for c in cs), default=0)
+        known[n] = {
+            "last_comment_id": max_id,
+            "ci": ci_status(n),
+            "labels": labels_str(pr),
+        }
+    return known
+
+
+def handle_signal(signum, _frame):
+    emit(f"WATCH_STOPPED repo={REPO} signal={signal.Signals(signum).name}")
+    sys.exit(0)
+
+
 def main():
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
     known = {}            # pr_number -> {"last_comment_id": int, "ci": str, "labels": str}
+    bootstrapped = False
 
     # Init: snapshot текущего состояния, без эмита истории.
     try:
         initial = list_open_prs()
-        for pr in initial:
-            n = pr["number"]
-            cs = list_comments(n)
-            max_id = max((c["id"] for c in cs), default=0)
-            known[n] = {
-                "last_comment_id": max_id,
-                "ci": ci_status(n),
-                "labels": labels_str(pr),
-            }
+        known = snapshot(initial)
+        bootstrapped = True
         emit(
             f"WATCH_STARTED repo={REPO} interval={INTERVAL}s "
             f"tracked_prs={len(known)}"
@@ -133,6 +159,19 @@ def main():
             # КРИТИЧНО: НЕ удаляем known PR — иначе при восстановлении
             # сети они будут "переоткрыты" с потерей контекста (CI/comments).
             emit(f"WATCH_ERROR list_prs: {e}")
+            time.sleep(INTERVAL)
+            continue
+
+        if not bootstrapped:
+            try:
+                known = snapshot(current)
+                bootstrapped = True
+                emit(
+                    f"WATCH_STARTED repo={REPO} interval={INTERVAL}s "
+                    f"tracked_prs={len(known)}"
+                )
+            except GhError as e:
+                emit(f"WATCH_ERROR init: {e}")
             time.sleep(INTERVAL)
             continue
 
