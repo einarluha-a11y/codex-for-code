@@ -52,6 +52,7 @@ _WARN_CAP = 1000
 _WARNED_CREATED_AT = set()
 _WARNED_COMMENT_ID_COLLISIONS = set()
 _WARNED_PR_LIMIT = set()
+_WARNED_TRUNCATED_CLOSE = set()
 _WARNED_CI_SHAPE = set()
 _WARNED_JSON_SHAPE = set()
 _WARNED_PR_MISSING = set()
@@ -132,8 +133,15 @@ def _parse_ndjson(raw):
 
     Частичный разбор здесь опаснее падения: watcher посчитал бы watermark по
     куску ленты и молча перестал бы эмитить новые события.
+
+    «Ничего не разобрано» и «разобрано в пустой список» — РАЗНЫЕ исходы, и
+    различает их отдельный признак, а не пустота результата. Строки `[]\\n[]`
+    (страницы без элементов) — законный пустой ответ; пустой stdout — отказ
+    gh. Общий `return items` уравнял бы их и превратил молчание gh в
+    «комментариев нет», то есть в тихую слепоту watcher'а.
     """
     items = []
+    parsed_any = False
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -142,11 +150,12 @@ def _parse_ndjson(raw):
             parsed = json.loads(line)
         except Exception:
             return None
+        parsed_any = True
         if isinstance(parsed, list):
             items.extend(parsed)
         else:
             items.append(parsed)
-    return items or None
+    return items if parsed_any else None
 
 
 def gh_json(args):
@@ -190,7 +199,7 @@ def list_open_prs():
     """
     global _review_field_supported
     base = ["pr", "list", "--repo", REPO, "--state", "open",
-            "--limit", str(_PR_LIMIT), "--json"]
+            "--limit", str(_PR_LIMIT + 1), "--json"]
     if _review_field_supported:
         try:
             prs = gh_json(base + [_PR_FIELDS])
@@ -208,13 +217,25 @@ def list_open_prs():
             prs = gh_json(base + [_PR_FIELDS_NO_REVIEW])
     else:
         prs = gh_json(base + [_PR_FIELDS_NO_REVIEW])
-    if len(prs) >= _PR_LIMIT and _remember_warning(_WARNED_PR_LIMIT, _PR_LIMIT):
+    if _truncated(prs) and _remember_warning(_WARNED_PR_LIMIT, _PR_LIMIT):
         emit(
-            f"WATCH_ERROR list_prs: вернулось {len(prs)} PR при лимите "
-            f"{_PR_LIMIT} — список мог быть усечён, PR сверх лимита "
-            f"не отслеживаются"
+            f"WATCH_ERROR list_prs: открытых PR больше {_PR_LIMIT} — список "
+            f"усечён, PR сверх лимита не отслеживаются, закрытия на таких "
+            f"итерациях не эмитятся"
         )
     return _validated_prs(prs)
+
+
+def _truncated(prs):
+    """True, если снимок ЗАВЕДОМО неполон.
+
+    Запрашивается на один PR больше лимита, поэтому усечение определяется
+    точно, а не подозревается: ровно `_PR_LIMIT` записей означают полный
+    список, `_PR_LIMIT + 1` — что дальше есть ещё. Сравнение `>=` с самим
+    лимитом путало бы эти случаи и глушило закрытия на репозитории, где
+    открытых PR ровно лимит.
+    """
+    return len(prs) > _PR_LIMIT
 
 
 def _validated_prs(prs):
@@ -302,6 +323,11 @@ def _remember_warning(warned, key):
 
 def _clear_warning_sets():
     """Сбросить ВСЕ множества анти-спама — детерминизм self-test.
+
+    Контракт префикса: глобальное имя `_WARNED_*` принадлежит множествам
+    анти-спама и ничему больше — заводить с этим префиксом иное значение
+    нельзя. Перебор ограничен множествами, поэтому чужой тип он не тронет,
+    но чужое МНОЖЕСТВО с таким именем молча попало бы под сброс.
 
     Перебором по globals, а не перечислением имён: перечисление забывается.
     Ровно так `_WARNED_JSON_SHAPE` и `_WARNED_PR_MISSING`, заведённые в
@@ -565,11 +591,24 @@ def main():
                     "review": review_str(current_by_num[n]),
                 }
 
-        # Закрытые (только если list_open_prs() реально успешно отработал)
-        for n in list(known.keys()):
-            if n not in current_nums:
-                emit(f"PR_CLOSED #{n}")
-                del known[n]
+        # Закрытые — только по ПОЛНОМУ снимку. Усечённый список лжёт ровно
+        # так же, как сетевой сбой: отсутствие PR в ответе означает «его не
+        # видно», а не «он закрыт». Событие необратимо (known теряет PR, и
+        # следующий полный снимок соврёт ещё и PR_OPENED), поэтому на
+        # заведомо неполном снимке шаг пропускается целиком. Пропуск
+        # переживается: закрытия доедут, как только список перестанет
+        # упираться в лимит.
+        if _truncated(current):
+            if _remember_warning(_WARNED_TRUNCATED_CLOSE, _PR_LIMIT):
+                emit(
+                    "WATCH_ERROR list_prs: снимок усечён лимитом — закрытия "
+                    "PR на таких итерациях не эмитятся"
+                )
+        else:
+            for n in list(known.keys()):
+                if n not in current_nums:
+                    emit(f"PR_CLOSED #{n}")
+                    del known[n]
 
         # Для каждого активного PR: новые комменты + изменения CI + метки.
         # Ошибки на конкретном PR не должны валить всю петлю.
@@ -650,6 +689,8 @@ def self_test():
     original_gh_json = globals()["gh_json"]
     original_subprocess = globals()["subprocess"]
     original_review_field = globals()["_review_field_supported"]
+    original_signal = globals()["signal"]
+    original_time = globals()["time"]
 
     def check(name, condition):
         results.append((name, bool(condition)))
@@ -941,22 +982,42 @@ def self_test():
               and "id collision" in warnings[0])
 
         # Усечение списка PR: --paginate у `gh pr list` не существует, но
-        # молчать про возможную потерю PR нельзя.
+        # молчать про потерю PR нельзя. Запрашивается лимит+1, поэтому
+        # усечение определяется точно.
         _WARNED_PR_LIMIT.clear()
         globals()["gh_json"] = lambda _args: [
-            {"number": i, "labels": []} for i in range(_PR_LIMIT)
+            {"number": i, "labels": []} for i in range(_PR_LIMIT + 1)
         ]
         before = len(captured)
         list_open_prs()
         list_open_prs()
         warnings = captured[before:]
         check("pr-limit-truncation",
-              len(warnings) == 1 and "мог быть усечён" in warnings[0])
+              len(warnings) == 1 and "список усечён" in warnings[0])
+
+        # Ровно лимит — список ПОЛНЫЙ, а не «подозрительный». Прежнее
+        # сравнение `>=` глушило бы здесь закрытия PR навсегда.
+        _WARNED_PR_LIMIT.clear()
+        globals()["gh_json"] = lambda _args: [
+            {"number": i, "labels": []} for i in range(_PR_LIMIT)
+        ]
+        before = len(captured)
+        exact = list_open_prs()
+        check("pr-limit-exact-is-complete",
+              captured[before:] == [] and not _truncated(exact))
 
         globals()["gh_json"] = lambda _args: [{"number": 1, "labels": []}]
         before = len(captured)
         list_open_prs()
         check("pr-limit-quiet-below", captured[before:] == [])
+
+        # Запрашиваем на один PR больше лимита — иначе полный список и
+        # усечённый неотличимы.
+        asked = []
+        globals()["gh_json"] = lambda args: (asked.append(args) or [])
+        list_open_prs()
+        check("pr-limit-asks-one-over",
+              any(str(_PR_LIMIT + 1) in a for a in asked[0]))
 
         # Старый gh не знает reviewDecision: без фолбэка КАЖДЫЙ опрос давал
         # бы WATCH_ERROR, и watcher жил бы, не отслеживая ничего.
@@ -1137,6 +1198,82 @@ def self_test():
                   not globals()["_WARNED_SELFTEST_PROBE"])
         finally:
             del globals()["_WARNED_SELFTEST_PROBE"]
+
+        # --- пустой построчный ответ ≠ отсутствие ответа ---
+        # Страницы без элементов — законный пустой результат.
+        check("json-ndjson-empty-pages-ok", _parse_ndjson("[]\n[]") == [])
+        check("json-ndjson-empty-object-list-ok",
+              _parse_ndjson("[]") == [] or _parse_ndjson("[]\n") == [])
+        # А пустой stdout остаётся отказом: буквальный `return items` из
+        # рекомендации ревью уравнял бы молчание gh с «событий нет» —
+        # то есть превратил бы сбой в тихую слепоту watcher'а.
+        check("json-empty-stdout-still-rejected",
+              _parse_ndjson("\n  \n") is None)
+
+        # Настоящий gh_json: выше он подменён заглушкой предыдущего теста.
+        globals()["gh_json"] = original_gh_json
+        globals()["subprocess"] = _FakeSubprocess(_Result(0, "[]\n[]", ""))
+        check("json-ndjson-empty-wired", gh_json(["api", "x"]) == [])
+
+        # --- закрытия PR не эмитятся на заведомо неполном снимке ---
+        class _StopLoop(Exception):
+            pass
+
+        class _FakeSignal:
+            SIGTERM = 15
+            SIGINT = 2
+
+            @staticmethod
+            def signal(_sig, _handler):
+                return None
+
+            @staticmethod
+            def Signals(value):
+                return value
+
+        class _FakeTime:
+            @staticmethod
+            def sleep(_seconds):
+                raise _StopLoop()
+
+        def one_iteration(second_snapshot):
+            """Бутстрап на PR 1 и 2, затем ОДНА итерация с другим списком."""
+            _clear_warning_sets()
+            snapshots = [
+                [{"number": 1, "title": "первый", "labels": []},
+                 {"number": 2, "title": "второй", "labels": []}],
+                second_snapshot,
+            ]
+
+            def loop_gh(args):
+                if args[0] == "pr" and args[1] == "list":
+                    return snapshots.pop(0) if len(snapshots) > 1 else \
+                        snapshots[0]
+                return []
+
+            globals()["gh_json"] = loop_gh
+            globals()["signal"] = _FakeSignal
+            globals()["time"] = _FakeTime
+            start = len(captured)
+            try:
+                main()
+            except _StopLoop:
+                pass
+            return captured[start:]
+
+        truncated = [
+            {"number": i, "title": f"pr-{i}", "labels": []}
+            for i in range(100, 100 + _PR_LIMIT + 1)
+        ]
+        lines = one_iteration(truncated)
+        check("truncated-snapshot-no-false-close",
+              not any(line.startswith("PR_CLOSED") for line in lines))
+
+        # Контроль: на ПОЛНОМ снимке закрытие обязано эмититься. Без него
+        # проверка выше проходила бы и при петле, которая не эмитит ничего.
+        lines = one_iteration([{"number": 2, "title": "второй", "labels": []}])
+        check("full-snapshot-still-closes",
+              any(line == "PR_CLOSED #1" for line in lines))
     except Exception as e:
         results.append((f"unexpected: {type(e).__name__}: {e}", False))
     finally:
@@ -1144,6 +1281,9 @@ def self_test():
         globals()["gh_json"] = original_gh_json
         globals()["subprocess"] = original_subprocess
         globals()["_review_field_supported"] = original_review_field
+        globals()["signal"] = original_signal
+        globals()["time"] = original_time
+        _clear_warning_sets()
 
     failed = [name for name, ok in results if not ok]
     total = len(results)
