@@ -1091,7 +1091,8 @@ def self_test():
         feed = [{"id": 1, "created_at": "2026-08-20T12:00:00Z"}]
         check("comments-shape-passthrough",
               _validated_comments(feed, "issues") == feed)
-        check("comments-shape-empty-ok", _validated_comments([], "pulls") == [])
+        check("comments-shape-empty-ok",
+              _validated_comments([], "pulls") == [])
 
         def rejects_feed(value):
             try:
