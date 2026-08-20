@@ -300,6 +300,19 @@ def _remember_warning(warned, key):
     return True
 
 
+def _clear_warning_sets():
+    """Сбросить ВСЕ множества анти-спама — детерминизм self-test.
+
+    Перебором по globals, а не перечислением имён: перечисление забывается.
+    Ровно так `_WARNED_JSON_SHAPE` и `_WARNED_PR_MISSING`, заведённые в
+    соседних правках, остались вне сброса, и результат тестов начал
+    зависеть от того, что процесс делал до них.
+    """
+    for name, value in list(globals().items()):
+        if name.startswith("_WARNED_") and isinstance(value, set):
+            value.clear()
+
+
 def comment_key(c):
     """Ключ порядка и watermark: (created_at, id).
 
@@ -334,6 +347,38 @@ def comment_key(c):
         return (_EPOCH, _norm_id_key(c.get("id")))
 
 
+def _validated_comments(items, kind):
+    """Лента комментариев или GhError, если её форма чужая.
+
+    Номер PR в сообщение не входит намеренно: вызывающий уже печатает его
+    в `WATCH_ERROR comments #N`, и дубль только удлинял бы строку.
+
+    Проверка стоит в ИСТОЧНИКЕ, а не у каждого потребителя. Элемент без
+    `.get` роняет ленту в трёх местах сразу — детект коллизий id, ключ
+    сортировки, эмит тела, — и точечная защита любого из них оставляет
+    остальные открытыми. AttributeError не наследует GhError, поэтому
+    пролетает мимо единственного `except` в петле и убивает watcher
+    целиком, а не одну ленту.
+
+    Отказ ленты целиком, а не пропуск кривых записей: watermark берётся
+    как максимум ленты, поэтому частичная лента задрала бы его выше
+    пропущенных комментариев — вернуться к ним watcher уже не смог бы
+    никогда. Отказ переживается: следующая итерация повторит запрос.
+    """
+    if not isinstance(items, list):
+        raise GhError(
+            f"форма ленты {kind}: ожидался список, "
+            f"пришло {type(items).__name__}"
+        )
+    for c in items:
+        if not isinstance(c, dict):
+            raise GhError(
+                f"форма ленты {kind}: запись типа {type(c).__name__} "
+                f"вместо объекта комментария"
+            )
+    return items
+
+
 def _comments_path(kind, pr):
     """Путь к ленте комментариев PR. kind: issues | pulls."""
     return f"repos/{REPO}/{kind}/{pr}/comments?per_page={_PER_PAGE}"
@@ -353,8 +398,12 @@ def list_comments(pr):
     комментариев больше страницы видел бы только САМЫЕ СТАРЫЕ, ставил
     watermark по ним и молча переставал эмитить новые.
     """
-    issues = gh_json(["api", "--paginate", _comments_path("issues", pr)])
-    reviews = gh_json(["api", "--paginate", _comments_path("pulls", pr)])
+    issues = _validated_comments(
+        gh_json(["api", "--paginate", _comments_path("issues", pr)]), "issues"
+    )
+    reviews = _validated_comments(
+        gh_json(["api", "--paginate", _comments_path("pulls", pr)]), "pulls"
+    )
     # В детект коллизий идут только приводимые к числу id: отсутствующий id
     # не образует коллизии, а c["id"] дал бы KeyError мимо GhError —
     # вызывающий код ловит только его, и watcher упал бы целиком. Проверка
@@ -452,7 +501,10 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    known = {}            # pr_number -> {"last_comment_key": (datetime, int), "ci": str, "labels": str}
+    # pr_number -> {"last_comment_key": (datetime, (kind, value)),
+    #               "ci": str, "labels": str, "review": str}
+    # Второй элемент ключа — разряд из _norm_id_key, а не голый int.
+    known = {}
     bootstrapped = False
 
     # Init: snapshot текущего состояния, без эмита истории.
@@ -604,10 +656,7 @@ def self_test():
 
     try:
         globals()["emit"] = captured.append
-        _WARNED_CREATED_AT.clear()
-        _WARNED_COMMENT_ID_COLLISIONS.clear()
-        _WARNED_PR_LIMIT.clear()
-        _WARNED_CI_SHAPE.clear()
+        _clear_warning_sets()
 
         plain = {"id": 1, "created_at": "2026-08-20T12:34:56Z"}
         fractional = {"id": 2, "created_at": "2026-08-20T12:34:56.123Z"}
@@ -1037,6 +1086,56 @@ def self_test():
         except GhError as e:
             wired = e
         check("pr-shape-wired-into-list-prs", isinstance(wired, GhError))
+
+        # --- форма ленты комментариев: только объекты ---
+        feed = [{"id": 1, "created_at": "2026-08-20T12:00:00Z"}]
+        check("comments-shape-passthrough",
+              _validated_comments(feed, "issues") == feed)
+        check("comments-shape-empty-ok", _validated_comments([], "pulls") == [])
+
+        def rejects_feed(value):
+            try:
+                _validated_comments(value, "issues")
+            except GhError:
+                return True
+            return False
+
+        # Строка вместо объекта роняла бы .get на AttributeError — мимо
+        # GhError, то есть уносила бы весь watcher, а не одну ленту.
+        check("comments-shape-not-dict", rejects_feed(["строка"]))
+        check("comments-shape-not-list", rejects_feed({"id": 1}))
+        check("comments-shape-no-partial",
+              rejects_feed([{"id": 1}, "кривая", {"id": 2}]))
+
+        # Точечная защита только детекта коллизий оставила бы ключ
+        # сортировки открытым: тот же элемент падает и в comment_key.
+        sort_crash = None
+        try:
+            sorted(["не объект"], key=comment_key)
+        except AttributeError as e:
+            sort_crash = e
+        check("comments-shape-sort-key-also-unsafe",
+              isinstance(sort_crash, AttributeError))
+
+        # Проводка: кривую ленту обязана отвергать РАБОЧАЯ функция, а не
+        # только валидатор в вакууме.
+        globals()["gh_json"] = lambda _args: [{"id": 1}, "не объект"]
+        feed_wired = None
+        try:
+            list_comments(1)
+        except GhError as e:
+            feed_wired = e
+        check("comments-shape-wired-into-list-comments",
+              isinstance(feed_wired, GhError))
+
+        # --- сброс анти-спама покрывает и множества, которых ещё нет ---
+        globals()["_WARNED_SELFTEST_PROBE"] = {"остаток"}
+        try:
+            _clear_warning_sets()
+            check("warning-reset-covers-new-sets",
+                  not globals()["_WARNED_SELFTEST_PROBE"])
+        finally:
+            del globals()["_WARNED_SELFTEST_PROBE"]
     except Exception as e:
         results.append((f"unexpected: {type(e).__name__}: {e}", False))
     finally:
