@@ -85,16 +85,29 @@ def labels_str(pr_obj):
     return ",".join(names)
 
 
+def comment_key(c):
+    """Ключ порядка и watermark: (created_at, id).
+
+    Только id нельзя: id-пространства issue-comments (~5.4e9) и
+    pull-review-comments (~3.0e9) НЕ согласованы — единый id-watermark
+    после первого issue-комментария навсегда отсёк бы review-comments.
+    ISO8601-Zulu created_at сравнивается лексикографически корректно;
+    id — тай-брейк внутри одной секунды.
+    """
+    return (c.get("created_at") or "", c["id"])
+
+
 def list_comments(pr):
     """Issue-comments + pull-review-comments одной лентой.
 
     СТРОГО: сбой любого из двух эндпоинтов = GhError всей функции —
     частичная лента сдвинула бы watermark по неполным данным.
+    Эндпоинты не пересекаются — дедуп не нужен (и дедуп по id мог бы
+    терять комментарии при коллизии id разных пространств).
     """
     issues = gh_json(["api", f"repos/{REPO}/issues/{pr}/comments"])
     reviews = gh_json(["api", f"repos/{REPO}/pulls/{pr}/comments"])
-    combined = {c["id"]: c for c in issues + reviews}
-    return [combined[k] for k in sorted(combined)]
+    return sorted(issues + reviews, key=comment_key)
 
 
 def ci_status(pr):
@@ -117,9 +130,8 @@ def snapshot(prs):
     for pr in prs:
         n = pr["number"]
         cs = list_comments(n)
-        max_id = max((c["id"] for c in cs), default=0)
         known[n] = {
-            "last_comment_id": max_id,
+            "last_comment_key": max((comment_key(c) for c in cs), default=("", 0)),
             "ci": ci_status(n),
             "labels": labels_str(pr),
         }
@@ -135,7 +147,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    known = {}            # pr_number -> {"last_comment_id": int, "ci": str, "labels": str}
+    known = {}            # pr_number -> {"last_comment_key": (str, int), "ci": str, "labels": str}
     bootstrapped = False
 
     # Init: snapshot текущего состояния, без эмита истории.
@@ -186,9 +198,10 @@ def main():
                     cs = list_comments(n)
                 except GhError:
                     cs = []
-                max_id = max((c["id"] for c in cs), default=0)
                 known[n] = {
-                    "last_comment_id": max_id,
+                    "last_comment_key": max(
+                        (comment_key(c) for c in cs), default=("", 0)
+                    ),
                     "ci": "",
                     "labels": labels_str(current_by_num[n]),
                 }
@@ -210,16 +223,17 @@ def main():
 
             try:
                 cs = list_comments(n)
-                last = state["last_comment_id"]
-                new = [c for c in cs if c["id"] > last]
+                last = state["last_comment_key"]
+                new = [c for c in cs if comment_key(c) > last]
                 if new:
-                    for c in sorted(new, key=lambda x: x["id"]):
+                    # cs уже отсортирован comment_key'ем в list_comments.
+                    for c in new:
                         author = c["user"]["login"]
                         body = (c["body"] or "").replace("\n", " ").replace("\r", " ")
                         if len(body) > 200:
                             body = body[:200] + "…"
                         emit(f"PR_COMMENT #{n} by {author} [id={c['id']}]: {body}")
-                    state["last_comment_id"] = max(c["id"] for c in cs)
+                    state["last_comment_key"] = max(comment_key(c) for c in cs)
             except GhError as e:
                 emit(f"WATCH_ERROR comments #{n}: {e}")
 
