@@ -1,19 +1,54 @@
 name: Codex Review
 
+# ─────────────────────────────────────────────────────────────────────────────
+# АПСТРИМ-ИСТОЧНИК ПРАВДЫ для копий этого workflow в проектах парка.
+# Копии в проектах-потребителях наследуют эту закалённую обвязку; правь ЗДЕСЬ,
+# затем раскатывай в потребителей (не наоборот).
+#
+# Закалённые фичи (все — детерминированный контроль ВНУТРИ самого CI):
+#   • guard-шаг: без секрета OPENAI_API_KEY job остаётся ЗЕЛЁНЫМ (а не красным) —
+#     чтобы codex можно было сделать required check, не ломая репозитории/форки
+#     без ключа (в т.ч. сам этот апстрим-репозиторий, где секрета нет).
+#   • SHA-pin: все actions запинены по коммит-SHA (supply-chain gate — тег @vN
+#     подменяем, SHA нет).
+#   • concurrency: новый push в PR отменяет предыдущее ревью того же PR (иначе
+#     платим за N ревью одного кода, когда чиним находки подряд).
+#   • trivial-check: docs-only PR → Codex не зовём (экономия), но job = success.
+#   • модель-фикс: gpt-5-mini / effort=medium — дефолт парка (~$0.08/review).
+#
+# 🔴 НЕ использовать workflow-level `paths-ignore`.
+#   Если `codex` — REQUIRED status check в branch protection, то при
+#   `paths-ignore: ['**.md']` docs-only PR НЕ триггерит workflow вообще →
+#   required-контекст `codex` НИКОГДА не рапортует → GitHub держит его вечно
+#   pending → PR ЗАБЛОКИРОВАН навсегда (наступали на это в парке).
+#   Экономия на docs-PR делается ВНУТРИ workflow через trivial-check:
+#   trivial=true → шаг Codex скипается, а сам job = success для required →
+#   docs-PR разблокирован, при этом дорогой Codex-API реально НЕ вызывается.
+#
 # Триггеры:
 #   opened/synchronize/reopened — авто-ревью на каждый push в PR.
 #   labeled(codex-review)        — ручной on-demand re-review.
 # Форки и боты исключены (нет доступа к секретам).
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   codex:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.type != 'Bot' &&
+      github.event.pull_request.draft != true &&
       (
         contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) ||
         (github.event.action == 'labeled' && github.event.label.name == 'codex-review')
@@ -25,37 +60,105 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
           fetch-depth: 0
 
+      - name: "trivial-check (docs-only → Codex не зовём)"
+        id: check
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA" || true)
+          echo "Changed files:"; echo "$CHANGED"
+          # Критичные пути НИКОГДА не trivial — даже если в диффе только они.
+          # ← добавь критичные пути СВОЕГО проекта (auth/, billing/, миграции,
+          #   security-конфиги) в этот grep, чтобы Codex ВСЕГДА ревьюил их.
+          if echo "$CHANGED" | grep -qE '(^\.github/workflows/|^scripts/|^package(-lock)?\.json$)'; then
+            echo "trivial=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Критичные пути в диффе — Codex review будет запущен"
+            exit 0
+          fi
+          # docs/readme/lockfile-only → trivial. Любой код → review.
+          NONTRIVIAL=$(echo "$CHANGED" | grep -vE '^(docs/|knowledge/|.*\.md$|^README|^LICENSE|^\.gitignore|^\.editorconfig)' || true)
+          if [ -z "$NONTRIVIAL" ] && [ -n "$CHANGED" ]; then
+            echo "trivial=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::docs-only PR — Codex SKIPPED"
+          else
+            echo "trivial=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "guard: есть ли OPENAI_API_KEY"
+        id: guard
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENAI_API_KEY не задан — Codex review пропущен"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Codex review
+        if: steps.check.outputs.trivial != 'true' && steps.guard.outputs.skip != 'true'
         id: codex
-        uses: openai/codex-action@v1
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # Дефолт парка: gpt-5-mini ($0.25/$2 за 1M tok) вместо gpt-5-codex
+          # ($1.25/$10) — 5× дешевле, для review качество достаточно (~$0.08/PR).
+          model: gpt-5-mini
+          effort: medium
           prompt: |
+            Ты — СТАРШИЙ инженер-ревьюер. Твоя уникальная ценность — СЕМАНТИЧЕСКИЙ слой,
+            который детерминированные инструменты НЕ ловят: lint / tsc / semgrep / gitleaks /
+            тесты прогоняются отдельно — НЕ дублируй их. Ищи то, что видно только при
+            ПОНИМАНИИ кода.
+
             Ревью PR в репозитории ${{ github.repository }}.
             Если в репозитории есть AGENTS.md — прочитай его (правила и контекст проекта).
 
             Diff: base ${{ github.event.pull_request.base.sha }} → head ${{ github.event.pull_request.head.sha }}.
 
-            Категории находок:
-            1. Критичные: баги, утечки секретов, SQL-инъекции, ломающие изменения API,
-               нарушения изоляции данных (multi-tenant / RLS).
-            2. Важные: нарушения правил из AGENTS.md (если есть), архитектурные проблемы,
-               дублирование, нарушения существующих паттернов проекта.
-            3. Стиль: any/unknown без обоснования, мёртвый код, нарушения conventional commits.
+            Охоться прежде всего за:
+            • Логическими ошибками / неверным поведением (не стилем) — код делает не то, что должен.
+            • Гонками состояний, порядком операций, незакрытыми ресурсами, утечками.
+            • Edge-cases: null/undefined, пустые коллекции, границы, off-by-one, необработанные промисы.
+            • Безопасностью В КОНТЕКСТЕ: обход auth/проверки прав, path traversal, инъекция в
+              реальном потоке данных, утечка данных пользователя, нарушение изоляции (multi-tenant/RLS).
+            • Скрытыми рисками: молчаливый провал, ложный успех, изменение контракта/API,
+              потеря данных при записи (нет backup/rollback).
 
-            Формат: markdown. Для каждой находки — путь:строка, цитата, объяснение, фикс.
-            Если PR хороший — "✅ LGTM" с кратким резюме что проверил.
-            CI (lint/tests/build) не дублируй — фокусируйся на смысловой части.
-            Отвечай на русском, если AGENTS.md не указывает иначе.
+            Категории находок:
+            1. Критичные: баги, утечки секретов, инъекции, ломающие изменения API,
+               нарушения изоляции данных.
+            2. Важные: нарушения правил из AGENTS.md, архитектурные проблемы, дублирование,
+               отход от существующих паттернов проекта.
+            3. Стиль: any/unknown без обоснования, мёртвый код (минимум — это работа линтера).
+
+            Формат: markdown. Для каждой находки — путь:строка, цитата, объяснение ПОЧЕМУ это
+            проблема, конкретный фикс. Если PR хороший — "✅ LGTM" с кратким резюме что проверил.
+            CI (lint/tests/build) не дублируй. Отвечай на русском, если AGENTS.md не указывает иначе.
+
+            ОБЯЗАТЕЛЬНО в конце — machine-readable verdict JSON-блок:
+            ```json
+            {
+              "verdict": "LGTM" | "NEEDS_FIX" | "NEEDS_HUMAN",
+              "severity": "none" | "style" | "important" | "critical" | "policy",
+              "items_count": <число находок>,
+              "policy_violation": true | false,
+              "summary": "<одна строка>"
+            }
+            ```
+            - LGTM: нет находок критичных/важных
+            - NEEDS_FIX: есть важные/критичные, которые auto-fix может исправить
+            - NEEDS_HUMAN: policy-нарушения, секреты/RLS, архитектурные вопросы
 
       - name: Post review
-        if: steps.codex.outputs.final-message != ''
-        uses: actions/github-script@v7
+        if: steps.check.outputs.trivial != 'true' && steps.guard.outputs.skip != 'true' && steps.codex.outputs.final-message != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CODEX_MESSAGE: ${{ steps.codex.outputs.final-message }}
         with:
@@ -69,6 +172,6 @@ jobs:
                 '',
                 process.env.CODEX_MESSAGE,
                 '',
-                '<sub>Автоматическое ревью от OpenAI Codex. Если не согласен — обоснуй в треде и поставь метку `needs-human`.</sub>'
+                '<sub>Автоматическое ревью от OpenAI Codex (gpt-5-mini, effort=medium). Если не согласен — обоснуй в треде и поставь метку `needs-human`.</sub>'
               ].join('\n')
             });
