@@ -51,11 +51,21 @@ _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
 _WARN_CAP = 1000
 _WARNED_CREATED_AT = set()
 _WARNED_COMMENT_ID_COLLISIONS = set()
+_WARNED_PR_LIMIT = set()
+_WARNED_CI_SHAPE = set()
 # Оба значения гасят «тихую слепоту» на пагинации: gh отдаёт 30 элементов по
 # умолчанию и молча теряет остальное. per_page=100 экономит запросы (watcher
 # опрашивает каждые INTERVAL секунд), --paginate добирает хвост.
 _PER_PAGE = 100
 _PR_LIMIT = 200
+# gh без поля reviewDecision выходит с кодом 1 и ПУСТЫМ stdout (проверено на
+# gh 2.83: stderr 'Unknown JSON field'), то есть КАЖДЫЙ опрос превращался бы в
+# WATCH_ERROR и watcher жил бы, не отслеживая ничего. Один раз деградируем до
+# набора без этого поля: теряются только события PR_REVIEW.
+_PR_FIELDS = "number,title,labels,reviewDecision"
+_PR_FIELDS_NO_REVIEW = "number,title,labels"
+_UNKNOWN_FIELD_STDERR = "unknown json field"
+_review_field_supported = True
 
 
 class GhError(Exception):
@@ -113,15 +123,41 @@ def list_open_prs():
     PR_CLOSED для всех known PR при rate-limit / network glitch.
 
     --limit обязателен: без него gh отдаёт 30 PR и остальные для watcher'а
-    просто не существуют. reviewDecision берётся здесь же — отдельный
-    запрос к /pulls/{n}/reviews стоил бы ещё одного вызова на КАЖДЫЙ PR в
-    КАЖДОМ опросе, а решение ревью доступно полем в уже делаемом запросе.
+    просто не существуют. Флага --paginate у `gh pr list` НЕ существует
+    (есть только --limit), поэтому полноту списка гарантировать нечем —
+    вместо этого громко предупреждаем о возможном усечении.
+
+    reviewDecision берётся здесь же — отдельный запрос к /pulls/{n}/reviews
+    стоил бы ещё одного вызова на КАЖДЫЙ PR в КАЖДОМ опросе, а решение
+    ревью доступно полем в уже делаемом запросе.
     """
-    return gh_json(
-        ["pr", "list", "--repo", REPO, "--state", "open",
-         "--limit", str(_PR_LIMIT),
-         "--json", "number,title,labels,reviewDecision"]
-    )
+    global _review_field_supported
+    base = ["pr", "list", "--repo", REPO, "--state", "open",
+            "--limit", str(_PR_LIMIT), "--json"]
+    if _review_field_supported:
+        try:
+            prs = gh_json(base + [_PR_FIELDS])
+        except GhError as e:
+            # ТОЛЬКО неизвестное поле. Прочие GhError (rate-limit / auth /
+            # network) обязаны пробрасываться: молчаливый повтор запроса
+            # замаскировал бы реальный сбой.
+            if _UNKNOWN_FIELD_STDERR not in str(e).lower():
+                raise
+            _review_field_supported = False
+            emit(
+                "WATCH_ERROR list_prs: gh не знает поле reviewDecision — "
+                "событий PR_REVIEW не будет, остальное отслеживается"
+            )
+            prs = gh_json(base + [_PR_FIELDS_NO_REVIEW])
+    else:
+        prs = gh_json(base + [_PR_FIELDS_NO_REVIEW])
+    if len(prs) >= _PR_LIMIT and _remember_warning(_WARNED_PR_LIMIT, _PR_LIMIT):
+        emit(
+            f"WATCH_ERROR list_prs: вернулось {len(prs)} PR при лимите "
+            f"{_PR_LIMIT} — список мог быть усечён, PR сверх лимита "
+            f"не отслеживаются"
+        )
+    return prs
 
 
 def labels_str(pr_obj):
@@ -141,11 +177,29 @@ def _norm_id_key(raw_id):
     Прямое c["id"] роняло watcher на объекте без поля, а сравнение int
     против str при равных датах давало TypeError. Числовые id идут раньше
     нечисловых и не схлопываются в одно значение.
+
+    У отсутствующего id СВОЙ разряд: иначе он давал бы (1, "None") и
+    схлопывался с легитимным строковым id "None" в один ключ — при равных
+    датах один из двух комментариев тихо считался бы уже виденным.
     """
+    if raw_id is None:
+        return (2, "")
     try:
         return (0, int(raw_id))
     except Exception:
         return (1, str(raw_id))
+
+
+def _numeric_id(raw_id):
+    """Числовое значение id или None, если привести нельзя.
+
+    Ровно та же нормализация, что у тай-брейка сортировки, и намеренно
+    через _norm_id_key: детект коллизий обязан видеть те же пары, что
+    схлопнутся в одинаковый ключ (int 10 и строка "10"). Отдельная копия
+    int()-логики разошлась бы с ключом при первой же правке.
+    """
+    kind, value = _norm_id_key(raw_id)
+    return value if kind == 0 else None
 
 
 def _remember_warning(warned, key):
@@ -218,11 +272,17 @@ def list_comments(pr):
     """
     issues = gh_json(["api", "--paginate", _comments_path("issues", pr)])
     reviews = gh_json(["api", "--paginate", _comments_path("pulls", pr)])
-    # В детект коллизий идут только валидные числовые id: отсутствующий id
+    # В детект коллизий идут только приводимые к числу id: отсутствующий id
     # не образует коллизии, а c["id"] дал бы KeyError мимо GhError —
-    # вызывающий код ловит только его, и watcher упал бы целиком.
-    issue_ids = {c.get("id") for c in issues if isinstance(c.get("id"), int)}
-    review_ids = {c.get("id") for c in reviews if isinstance(c.get("id"), int)}
+    # вызывающий код ловит только его, и watcher упал бы целиком. Проверка
+    # isinstance(int) здесь была бы уже, чем ключ сортировки: пара int 10 /
+    # строка "10" схлопывается в один ключ, но коллизией не считалась бы.
+    issue_ids = {
+        i for i in (_numeric_id(c.get("id")) for c in issues) if i is not None
+    }
+    review_ids = {
+        i for i in (_numeric_id(c.get("id")) for c in reviews) if i is not None
+    }
     new_collisions = [
         collision for collision in sorted(issue_ids & review_ids)
         if _remember_warning(_WARNED_COMMENT_ID_COLLISIONS, (pr, collision))
@@ -254,8 +314,27 @@ def ci_status(pr):
         )
     except GhNoChecks:
         return ""
-    pairs = sorted(f"{c['name']}={c['state']}" for c in raw)
-    return ",".join(pairs)
+    # Прямые c['name'] / c['state'] роняли бы watcher ЦЕЛИКОМ при смене
+    # формы ответа: KeyError — не GhError, а вызывающий код ловит только
+    # GhError. Неполную запись показываем как '?' и предупреждаем один раз:
+    # тихо подставить пустое значение хуже — оператор увидел бы «проверок
+    # нет» вместо «gh ответил не тем».
+    pairs = []
+    incomplete = False
+    for c in raw:
+        if not isinstance(c, dict):
+            incomplete = True
+            pairs.append("?=?")
+            continue
+        if "name" not in c or "state" not in c:
+            incomplete = True
+        pairs.append(f"{c.get('name', '?')}={c.get('state', '?')}")
+    if incomplete and _remember_warning(_WARNED_CI_SHAPE, pr):
+        emit(
+            f"WATCH_ERROR ci #{pr}: ответ gh без полей name/state — "
+            f"состояние проверок показано частично"
+        )
+    return ",".join(sorted(pairs))
 
 
 def review_str(pr_obj):
@@ -402,6 +481,11 @@ def main():
 
             try:
                 cur_ci = ci_status(n)
+                # Переход в "" НЕ эмитим намеренно: между push и созданием
+                # чеков gh штатно отвечает 'no checks reported' → "", и эмит
+                # на любое изменение давал бы ровно один ложный пустой PR_CI
+                # на КАЖДЫЙ push каждого PR. Цена размена названа прямо:
+                # редкий случай «проверки убрали совсем» остаётся незамеченным.
                 if cur_ci and cur_ci != state["ci"]:
                     emit(f"PR_CI #{n} | {cur_ci}")
                     state["ci"] = cur_ci
@@ -418,6 +502,7 @@ def self_test():
     original_emit = globals()["emit"]
     original_gh_json = globals()["gh_json"]
     original_subprocess = globals()["subprocess"]
+    original_review_field = globals()["_review_field_supported"]
 
     def check(name, condition):
         results.append((name, bool(condition)))
@@ -426,6 +511,8 @@ def self_test():
         globals()["emit"] = captured.append
         _WARNED_CREATED_AT.clear()
         _WARNED_COMMENT_ID_COLLISIONS.clear()
+        _WARNED_PR_LIMIT.clear()
+        _WARNED_CI_SHAPE.clear()
 
         plain = {"id": 1, "created_at": "2026-08-20T12:34:56Z"}
         fractional = {"id": 2, "created_at": "2026-08-20T12:34:56.123Z"}
@@ -639,14 +726,122 @@ def self_test():
         check("gh-error-not-masked",
               isinstance(rate_limit_error, GhError)
               and not isinstance(rate_limit_error, GhNoChecks))
+
+        globals()["subprocess"] = original_subprocess
+
+        # Ответ gh без ожидаемых полей: прямое c['name'] дало бы KeyError,
+        # который НЕ GhError и уронил бы весь watcher, а не один PR.
+        _WARNED_CI_SHAPE.clear()
+
+        def broken_shape_gh(_args):
+            return [{"name": "codex"}, {"state": "SUCCESS"}, "не-словарь"]
+
+        globals()["gh_json"] = broken_shape_gh
+        before = len(captured)
+        shape_ci = ci_status(11)
+        ci_status(11)
+        warnings = captured[before:]
+        check("ci-shape-survives",
+              shape_ci == "?=?,?=SUCCESS,codex=?"
+              and len(warnings) == 1
+              and warnings[0].startswith("WATCH_ERROR ci #11:"))
+
+        # Отсутствующий id обязан иметь СВОЙ разряд: (1, "None") схлопнулся
+        # бы с легитимным строковым id "None" в один ключ.
+        check("missing-id-bucket",
+              _norm_id_key(None) == (2, "")
+              and _norm_id_key("None") == (1, "None")
+              and _norm_id_key(None) != _norm_id_key("None")
+              and _norm_id_key(5) < _norm_id_key("abc") < _norm_id_key(None))
+
+        # Сошлось у двух независимых ревьюеров: детект коллизий обязан
+        # видеть ровно те пары, что схлопываются в одинаковый тай-брейк.
+        # isinstance(int) пропускал пару int 10 / строка "10".
+        _WARNED_COMMENT_ID_COLLISIONS.clear()
+        issue_mixed = [{"id": 10, "created_at": "2026-08-20T12:00:00Z"}]
+        review_mixed = [{"id": "10", "created_at": "2026-08-20T12:01:00Z"}]
+
+        def mixed_type_gh(args):
+            return issue_mixed if _is_issues(args) else review_mixed
+
+        globals()["gh_json"] = mixed_type_gh
+        before = len(captured)
+        list_comments(12)
+        warnings = captured[before:]
+        check("collision-mixed-type",
+              _norm_id_key(10) == _norm_id_key("10")
+              and len(warnings) == 1
+              and "id collision" in warnings[0])
+
+        # Усечение списка PR: --paginate у `gh pr list` не существует, но
+        # молчать про возможную потерю PR нельзя.
+        _WARNED_PR_LIMIT.clear()
+        globals()["gh_json"] = lambda _args: [
+            {"number": i, "labels": []} for i in range(_PR_LIMIT)
+        ]
+        before = len(captured)
+        list_open_prs()
+        list_open_prs()
+        warnings = captured[before:]
+        check("pr-limit-truncation",
+              len(warnings) == 1 and "мог быть усечён" in warnings[0])
+
+        globals()["gh_json"] = lambda _args: [{"number": 1, "labels": []}]
+        before = len(captured)
+        list_open_prs()
+        check("pr-limit-quiet-below", captured[before:] == [])
+
+        # Старый gh не знает reviewDecision: без фолбэка КАЖДЫЙ опрос давал
+        # бы WATCH_ERROR, и watcher жил бы, не отслеживая ничего.
+        globals()["_review_field_supported"] = True
+        fallback_calls = []
+
+        def old_gh(args):
+            fallback_calls.append(args)
+            if _PR_FIELDS in args:
+                raise GhError('exit=1: Unknown JSON field: "reviewDecision"')
+            return [{"number": 3, "labels": []}]
+
+        globals()["gh_json"] = old_gh
+        before = len(captured)
+        degraded = list_open_prs()
+        list_open_prs()
+        warnings = captured[before:]
+        check("review-field-fallback",
+              degraded == [{"number": 3, "labels": []}]
+              and len(warnings) == 1
+              and "reviewDecision" in warnings[0]
+              # Второй опрос уже не пробует неизвестное поле повторно.
+              and len(fallback_calls) == 3)
+
+        # Настоящий сбой gh не имеет права превратиться в повтор запроса:
+        # rate-limit замаскировался бы под «старый gh».
+        globals()["_review_field_supported"] = True
+        retry_calls = []
+
+        def rate_limited_gh(args):
+            retry_calls.append(args)
+            raise GhError("exit=1: API rate limit exceeded for user ID 1")
+
+        globals()["gh_json"] = rate_limited_gh
+        propagated = None
+        try:
+            list_open_prs()
+        except GhError as e:
+            propagated = e
+        check("review-fallback-not-masking",
+              isinstance(propagated, GhError)
+              and len(retry_calls) == 1
+              and globals()["_review_field_supported"] is True)
     except Exception as e:
         results.append((f"unexpected: {type(e).__name__}: {e}", False))
     finally:
         globals()["emit"] = original_emit
         globals()["gh_json"] = original_gh_json
         globals()["subprocess"] = original_subprocess
+        globals()["_review_field_supported"] = original_review_field
 
-    failed = [name for name, ok in results if not ok]
+    failed =[name for name, ok in results if not ok]
     total = len(results)
     if failed:
         for name in failed:
