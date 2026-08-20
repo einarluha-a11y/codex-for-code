@@ -62,6 +62,15 @@ _PR_LIMIT = 200
 # gh 2.83: stderr 'Unknown JSON field'), то есть КАЖДЫЙ опрос превращался бы в
 # WATCH_ERROR и watcher жил бы, не отслеживая ничего. Один раз деградируем до
 # набора без этого поля: теряются только события PR_REVIEW.
+# --paginate делает НЕСКОЛЬКО HTTP-запросов подряд под ОДНИМ таймаутом, поэтому
+# общий лимит обязан быть больше обычного. Замерено на gh 2.83 при быстром
+# канале: одна страница ленты ~0.8 с, 31 страница ~15.3 с (≈0.49 с/страница) —
+# то есть прежние общие 20 с ломались бы примерно на 40 страницах, а на вдвое
+# более медленном канале уже на двадцати. Ценой был бы не сбой, а слепота:
+# GhError на каждом опросе, и этот PR никогда не попал бы под наблюдение.
+# Короткий лимит для остальных вызовов сохранён намеренно — быстрый отказ.
+_GH_TIMEOUT = int(os.environ.get("GH_TIMEOUT", "20"))
+_GH_TIMEOUT_PAGINATED = int(os.environ.get("GH_TIMEOUT_PAGINATED", "120"))
 _PR_FIELDS = "number,title,labels,reviewDecision"
 _PR_FIELDS_NO_REVIEW = "number,title,labels"
 _UNKNOWN_FIELD_STDERR = "unknown json field"
@@ -90,11 +99,17 @@ _NO_CHECKS_STDERR = "no checks reported"
 
 
 def gh(args):
-    """Вызов gh. Возвращает stdout. Кидает GhError при сбое."""
+    """Вызов gh. Возвращает stdout. Кидает GhError при сбое.
+
+    Таймаут зависит от того, многостраничный ли запрос: точное вхождение
+    '--paginate' в аргументы, а не поиск подстроки — иначе путь, случайно
+    содержащий это слово, тихо получил бы чужой лимит.
+    """
+    timeout = _GH_TIMEOUT_PAGINATED if "--paginate" in args else _GH_TIMEOUT
     try:
         out = subprocess.run(
             ["gh"] + args,
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, timeout=timeout,
         )
     except Exception as e:
         raise GhError(f"subprocess: {e}")
@@ -727,6 +742,29 @@ def self_test():
               isinstance(rate_limit_error, GhError)
               and not isinstance(rate_limit_error, GhNoChecks))
 
+        # Многостраничный запрос обязан получать БОЛЬШИЙ таймаут: --paginate
+        # делает несколько HTTP-запросов подряд под одним лимитом (замерено:
+        # 31 страница ≈ 15.3 с при быстром канале), и прежние общие 20 с
+        # обрекли бы активный PR на GhError в КАЖДОМ опросе.
+        class _TimeoutSpy:
+            """Ловит kwargs subprocess.run, не выходя в сеть."""
+
+            def __init__(self):
+                self.timeouts = []
+
+            def run(self, *_args, **kwargs):
+                self.timeouts.append(kwargs.get("timeout"))
+                return _Result(0, "[]", "")
+
+        spy = _TimeoutSpy()
+        globals()["subprocess"] = spy
+        gh(["api", "--paginate", "repos/x/y/issues/1/comments?per_page=100"])
+        gh(["pr", "checks", "1", "--repo", REPO, "--json", "name,state"])
+        gh(["api", "repos/x/y/pulls?paginate-lookalike=1"])
+        check("paginated-timeout",
+              spy.timeouts == [_GH_TIMEOUT_PAGINATED, _GH_TIMEOUT, _GH_TIMEOUT]
+              and _GH_TIMEOUT_PAGINATED > _GH_TIMEOUT)
+
         globals()["subprocess"] = original_subprocess
 
         # Ответ gh без ожидаемых полей: прямое c['name'] дало бы KeyError,
@@ -841,7 +879,7 @@ def self_test():
         globals()["subprocess"] = original_subprocess
         globals()["_review_field_supported"] = original_review_field
 
-    failed =[name for name, ok in results if not ok]
+    failed = [name for name, ok in results if not ok]
     total = len(results)
     if failed:
         for name in failed:
