@@ -39,7 +39,7 @@ session-length). Эмитит события в чат:
 | `PR_CI #N` | Изменился состав CI checks |
 | `PR_LABELS #N` | Изменился набор меток (used by approve-flow §3) |
 
-Интервал: 25 секунд. При сбое `gh` (rate-limit / network) — `WATCH_ERROR`
+Интервал: 30 секунд. При сбое `gh` (rate-limit / network) — `WATCH_ERROR`
 с сохранением состояния (без ложных PR_CLOSED).
 
 ## 3. Approve-петля через GitHub Environment
