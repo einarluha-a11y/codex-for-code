@@ -1,0 +1,63 @@
+name: pr-watch self-test
+
+# ─────────────────────────────────────────────────────────────────────────────
+# АПСТРИМ-ИСТОЧНИК ПРАВДЫ для копий этого workflow в проектах парка.
+#
+# Зачем: у scripts/pr-watch.py есть встроенный --self-test, но до этого
+# workflow его НИЧТО не запускало автоматически — тест существовал, а
+# принуждения не было («построено, но не вкручено»). Инварианты watcher'а
+# при этом хрупкие и молчаливые:
+#   • ключ сравнения обязан быть однородным по типам — иначе TypeError
+#     роняет весь цикл и владелец перестаёт получать события МОЛЧА;
+#   • ленты комментариев обязаны запрашиваться с --paginate — иначе gh
+#     отдаёт первую страницу (самые СТАРЫЕ комментарии), watermark встаёт
+#     по ним, и watcher слепнет на активном PR, продолжая выглядеть живым.
+# Оба класса дают не падение, а тишину, поэтому ловить их обязана машина.
+#
+# Матрица версий проверяет заявленный в файле инвариант «только stdlib,
+# Python 3.9+»: младшая версия ловит синтаксис/вызовы новее 3.9, старшая —
+# то, что в новых версиях стало ошибкой.
+#
+# SHA-pin всех actions — как в codex-review.yml (тег @vN подменяем, SHA нет).
+#
+# 🔴 БЕЗ paths-фильтра намеренно. Если сделать этот job required, то PR,
+#   не трогающий scripts/, не триггерил бы workflow вообще → required-контекст
+#   никогда не рапортует → GitHub держит PR вечно pending (парк на это
+#   наступал, см. шапку codex-review.yml). Прогон дешёвый: stdlib, без сети.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+concurrency:
+  group: pr-watch-selftest-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Синтаксис
+        run: python3 -m py_compile scripts/pr-watch.py
+
+      - name: Self-test
+        # REPO не задан намеренно: при --self-test скрипт обязан обойти
+        # auto-detect и не звать gh. Если эта развязка сломается, шаг упадёт
+        # здесь — на раннере нет ни gh-авторизации, ни git-remote.
+        run: python3 scripts/pr-watch.py --self-test
