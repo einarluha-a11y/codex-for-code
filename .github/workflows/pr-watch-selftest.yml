@@ -61,3 +61,15 @@ jobs:
         # auto-detect и не звать gh. Если эта развязка сломается, шаг упадёт
         # здесь — на раннере нет ни gh-авторизации, ни git-remote.
         run: python3 scripts/pr-watch.py --self-test
+
+      - name: Self-test под снятыми предохранителями локали
+        # Оба штатных предохранителя Python отключены НАМЕРЕННО: под
+        # обычным LC_ALL=C включается UTF-8-режим, и обычный прогон этот
+        # класс не ловит вовсе. Здесь кодировка потока становится ascii —
+        # и любая зависимость события от локали падает сразу.
+        env:
+          LC_ALL: C
+          LANG: C
+          PYTHONUTF8: '0'
+          PYTHONCOERCECLOCALE: '0'
+        run: python3 scripts/pr-watch.py --self-test

@@ -358,9 +358,40 @@ def _emit_raw(line):
     лежит в буфере, и прерванное событие допечатается интерпретатором
     ПОСЛЕ WATCH_STOPPED. Порядок нарушается, строки — нет: буфер сливается
     одним куском, а os.write короткой строки атомарен.
+
+    Дескриптор 1 записан числом намеренно. Ревью предлагало
+    sys.__stdout__.fileno(); замер отвергает по трём пунктам. Значение то
+    же — исходный поток интерпретатора по построению сидит на fd 1.
+    Защиты не добавляет: после os.close(1) вызов всё равно вернул 1, то
+    есть закрытый дескриптор он не замечает. А платить пришлось бы новым
+    отказом: sys.__stdout__ по документации бывает None, и тогда
+    AttributeError гасится except ниже — ПОСЛЕДНЕЕ событие пропадает
+    молча, ровно тот исход, против которого эта функция и написана.
+    Держится кейсом emit-raw-survives-none-original-stdout.
     """
     try:
         os.write(1, (line + "\n").encode("utf-8", "replace"))
+    except Exception:
+        pass
+
+
+def _force_utf8_stdout():
+    """Событие не должно зависеть от локали процесса.
+
+    print() кодирует строку кодировкой sys.stdout, а она берётся из локали.
+    Штатные предохранители Python обычно спасают: под LC_ALL=C включается
+    UTF-8-режим (замер: utf8_mode=1), и кириллица печатается. Но их
+    снимают одной переменной окружения, и тогда кодировка становится
+    ascii. Замер при PYTHONUTF8=0 и LC_ALL=C: print русского заголовка PR
+    падает с UnicodeEncodeError, исключение уходит в фатальную ветку
+    run(), и watcher умирает на первом же таком PR — а заголовки в парке
+    русские. _emit_raw кодирует utf-8 явно; здесь то же самое для
+    обычного пути, чтобы контракт «строка = событие» не зависел от среды.
+    errors="replace": нечитаемый символ не имеет права обрывать поток
+    событий. Держится кейсом run-forces-utf8-stdout.
+    """
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
@@ -856,6 +887,7 @@ def run():
     напечатавший своё WATCH_STOPPED, и перехват дал бы второе, ложное
     событие с signal=EXCEPTION.
     """
+    _force_utf8_stdout()
     try:
         return main() or 0
     except SystemExit:
@@ -1761,7 +1793,9 @@ def self_test():
         real_stdout = sys.stdout
         os.dup2(write_fd, 1)
         try:
-            sys.stdout = io.TextIOWrapper(io.BufferedWriter(_BusyStdout()))
+            sys.stdout = io.TextIOWrapper(
+                io.BufferedWriter(_BusyStdout()), encoding="utf-8", errors="replace"
+            )
             try:
                 print("основное событие", flush=True)
             except SystemExit:
@@ -1783,6 +1817,32 @@ def self_test():
         )
         globals()["_emit_raw"] = captured.append
 
+        # Отказ от sys.__stdout__.fileno() в _emit_raw закреплён машинно.
+        # Предложенная ревью форма при sys.__stdout__ is None подняла бы
+        # AttributeError, тот погасился бы внутренним except — и ПОСЛЕДНЕЕ
+        # событие пропало бы молча. Работает настоящий _emit_raw, приём
+        # идёт с fd 1: проверяется доставка, а не отсутствие падения.
+        globals()["_emit_raw"] = original_emit_raw
+        saved_fd = os.dup(1)
+        read_fd, write_fd = os.pipe()
+        saved_original_stdout = sys.__stdout__
+        os.dup2(write_fd, 1)
+        try:
+            sys.__stdout__ = None
+            _emit_raw("WATCH_STOPPED repo=owner/name signal=SIGTERM")
+        finally:
+            sys.__stdout__ = saved_original_stdout
+            os.dup2(saved_fd, 1)
+            os.close(saved_fd)
+            os.close(write_fd)
+        payload = os.read(read_fd, 4096).decode("utf-8", "replace")
+        os.close(read_fd)
+        check(
+            "emit-raw-survives-none-original-stdout",
+            payload == "WATCH_STOPPED repo=owner/name signal=SIGTERM\n",
+        )
+        globals()["_emit_raw"] = captured.append
+
         # Ветки except в run() печатают обычным emit — и это верно. Кейсы
         # держат вывод машинно: исключение поднимается ИЗНУТРИ незавершённой
         # записи в буфер, раскручивает стек, и блок except печатает в тот же
@@ -1794,17 +1854,25 @@ def self_test():
         globals()["emit"] = original_emit
         globals()["REPO"] = "owner/name"
 
-        def _run_with_broken_stdout(main_stub):
+        def _run_with_stdout(main_stub, encoding="utf-8", errors="replace"):
+            """Прогон run() поверх подставного stdout.
+
+            main_stub.error — исключение, которое поднимается ИЗНУТРИ
+            первой записи в буфер; None означает «запись не ломать».
+            encoding/errors задают обёртку: "ascii"/"strict" нужны, чтобы
+            проверить, что run() сам переводит поток в utf-8.
+            """
             state = {}
 
-            class _RaiseMidWrite(io.RawIOBase):
+            class _StubRaw(io.RawIOBase):
                 def writable(self):
                     return True
 
                 def write(self, chunk):
-                    if not state.get("fired"):
+                    err = state.get("error")
+                    if err is not None and not state.get("fired"):
                         state["fired"] = True
-                        raise state["error"]
+                        raise err
                     os.write(1, chunk)
                     return len(chunk)
 
@@ -1815,7 +1883,9 @@ def self_test():
             real_stdout = sys.stdout
             os.dup2(write_fd, 1)
             try:
-                sys.stdout = io.TextIOWrapper(io.BufferedWriter(_RaiseMidWrite()))
+                sys.stdout = io.TextIOWrapper(
+                    io.BufferedWriter(_StubRaw()), encoding=encoding, errors=errors
+                )
                 try:
                     state["rc"] = run()
                 except BaseException as e:
@@ -1838,7 +1908,7 @@ def self_test():
             return 0
 
         _main_interrupted.error = KeyboardInterrupt()
-        ki = _run_with_broken_stdout(_main_interrupted)
+        ki = _run_with_stdout(_main_interrupted)
         check(
             "except-keyboardinterrupt-emits-after-unwound-write",
             ki.get("raised") == "KeyboardInterrupt"
@@ -1850,7 +1920,7 @@ def self_test():
             return 0
 
         _main_crashed.error = ValueError("сбой записи")
-        crash = _run_with_broken_stdout(_main_crashed)
+        crash = _run_with_stdout(_main_crashed)
         check(
             "except-exception-emits-after-unwound-write",
             crash.get("raised") is None
@@ -1858,6 +1928,24 @@ def self_test():
             and "WATCH_ERROR fatal: ValueError: сбой записи" in crash["payload"]
             and "WATCH_STOPPED repo=owner/name signal=EXCEPTION\n" in crash["payload"],
         )
+
+        # Поток намеренно создан в ascii — это воспроизводит среду, где
+        # предохранители Python сняты. Без _force_utf8_stdout() print
+        # русского заголовка падает с UnicodeEncodeError, run() уходит в
+        # фатальную ветку, и вместо события приходит WATCH_ERROR.
+        def _main_russian():
+            print("PR_OPENED #1 | Русский заголовок", flush=True)
+            return 0
+
+        _main_russian.error = None
+        utf8 = _run_with_stdout(_main_russian, encoding="ascii", errors="strict")
+        check(
+            "run-forces-utf8-stdout",
+            utf8.get("raised") is None
+            and utf8.get("rc") == 0
+            and "PR_OPENED #1 | Русский заголовок" in utf8["payload"],
+        )
+
         globals()["emit"] = captured.append
         globals()["main"] = original_main
 
