@@ -17,6 +17,18 @@
                                          — сигнал, NO_REPO (репозиторий не
                                            определился) или EXCEPTION
                                            (необработанный сбой)
+
+Коды выхода:
+  0   — штатное завершение main(), а также SIGTERM/SIGINT, пришедшие в
+        установленный обработчик: handle_signal печатает WATCH_STOPPED и
+        выходит через sys.exit(0).
+  1   — необработанный сбой. Перед выходом печатаются WATCH_ERROR и
+        WATCH_STOPPED signal=EXCEPTION.
+  130 — SIGINT, пришедший в узкое окно ДО установки обработчиков (первые
+        строки main()). Там сигнал приходит исключением; KeyboardInterrupt
+        пробрасывается, и код выхода даёт интерпретатор. Ранние версии
+        печатали здесь WATCH_ERROR и возвращали 1 — единица врала и
+        оболочке, и потребителю событий (разбор в комментарии run()).
 """
 import io
 import json
@@ -359,6 +371,14 @@ def _emit_raw(line):
     ПОСЛЕ WATCH_STOPPED. Порядок нарушается, строки — нет: буфер сливается
     одним куском, а os.write короткой строки атомарен.
 
+    Граница «короткой» строки явная: POSIX гарантирует атомарность записи
+    в канал до PIPE_BUF (4096 байт на Linux и macOS). Единственный
+    продовый вызов даёт фиксированный формат
+    `WATCH_STOPPED repo=<owner/name> signal=<NAME>` — с лимитами GitHub
+    на длину owner и name потолок составляет около 180 байт, то есть до
+    границы на порядок. Инвариант «единственный вызов» держится кейсом
+    emit-raw-has-single-production-call-site, а не чтением кода.
+
     Дескриптор 1 записан числом намеренно. Ревью предлагало
     sys.__stdout__.fileno(); замер отвергает по трём пунктам. Значение то
     же — исходный поток интерпретатора по построению сидит на fd 1.
@@ -406,11 +426,29 @@ def _force_utf8_stdout():
     обычного пути, чтобы контракт «строка = событие» не зависел от среды.
     errors="replace": нечитаемый символ не имеет права обрывать поток
     событий. Держится кейсом run-forces-utf8-stdout.
+
+    Перехват остаётся широким намеренно — сужение до AttributeError
+    (рекомендация ревью) отвергнуто: вызов _force_utf8_stdout() стоит ДО
+    try в run(), поэтому любое непредусмотренное исключение отсюда уйдёт
+    голым трейсбеком, без единого события — ровно тот класс отказа, против
+    которого написан весь файл.
+
+    Прежний `except Exception: pass` был дефектом: отказ молчал, а его
+    цена названа в этом же docstring — смерть watcher-а на первом же
+    русском заголовке PR. Теперь причина уходит в fd 2 тем же приёмом,
+    что в _emit_raw. Держится кейсом utf8-failure-reports-cause-to-fd2.
     """
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    except Exception as exc:
+        try:
+            os.write(
+                2,
+                ("PR_WATCH_UTF8_FAILED %s: %s\n"
+                 % (type(exc).__name__, exc)).encode("utf-8", "replace"),
+            )
+        except Exception:
+            pass
 
 
 def _norm_id_key(raw_id):
@@ -1891,6 +1929,36 @@ def self_test():
         )
         globals()["_emit_raw"] = captured.append
 
+        # Единственный продовый вызов _emit_raw — инвариант, на котором
+        # стоит гарантия атомарности. Кейс доказывает его через AST,
+        # чтобы случайное добавление второго вызова не прошло незамеченным.
+        import ast as _ast
+        with open(__file__, encoding="utf-8") as _fh:
+            _file_src = _fh.read()
+        _selftest_start = _file_src.index("\ndef self_test(")
+        _prod_src = _file_src[:_selftest_start]
+        _prod_tree = _ast.parse(_prod_src)
+        _emit_raw_calls = [
+            _node
+            for _node in _ast.walk(_prod_tree)
+            if (isinstance(_node, _ast.Call)
+                and isinstance(_node.func, _ast.Name)
+                and _node.func.id == "_emit_raw")
+        ]
+        _first_arg_ok = False
+        if len(_emit_raw_calls) == 1:
+            _arg0 = (_emit_raw_calls[0].args[0]
+                     if _emit_raw_calls[0].args else None)
+            if isinstance(_arg0, _ast.JoinedStr) and _arg0.values:
+                _first_piece = _arg0.values[0]
+                if (isinstance(_first_piece, _ast.Constant)
+                        and isinstance(_first_piece.value, str)):
+                    _first_arg_ok = _first_piece.value.startswith(
+                        "WATCH_STOPPED"
+                    )
+        check("emit-raw-has-single-production-call-site",
+              len(_emit_raw_calls) == 1 and _first_arg_ok)
+
         # Ветки except в run() печатают обычным emit — и это верно. Кейсы
         # держат вывод машинно: исключение поднимается ИЗНУТРИ незавершённой
         # записи в буфер, раскручивает стек, и блок except печатает в тот же
@@ -1996,6 +2064,29 @@ def self_test():
 
         globals()["emit"] = captured.append
         globals()["main"] = original_main
+
+        # Отказ _force_utf8_stdout больше не молчит: причина уходит в fd 2.
+        class _FailingStdout:
+            def reconfigure(self, *_a, **_k):
+                raise OSError("no reconfigure")
+        _saved_stdout_utf8 = sys.stdout
+        _utf8_rd, _utf8_wr = os.pipe()
+        _saved_err_utf8 = os.dup(2)
+        os.dup2(_utf8_wr, 2)
+        os.close(_utf8_wr)
+        try:
+            sys.stdout = _FailingStdout()
+            _force_utf8_stdout()
+        finally:
+            sys.stdout = _saved_stdout_utf8
+            os.dup2(_saved_err_utf8, 2)
+            os.close(_saved_err_utf8)
+        _utf8_fail_payload = os.read(_utf8_rd, 4096).decode("utf-8", "replace")
+        os.close(_utf8_rd)
+        check("utf8-failure-reports-cause-to-fd2",
+              "PR_WATCH_UTF8_FAILED" in _utf8_fail_payload
+              and "OSError" in _utf8_fail_payload
+              and "no reconfigure" in _utf8_fail_payload)
 
         # Переменная окружения читается ВНУТРИ main(). Была раздвоенная
         # политика: переменная на импорте, авто-определение в main. Значение,
