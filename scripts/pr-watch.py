@@ -175,8 +175,77 @@ def _repo_is_valid(value):
     return all(ch in allowed for ch in owner + name)
 
 
+class _EnvValueError(ValueError):
+    """Числовая переменная окружения не разобралась.
+
+    Выделенное исключение, а не sys.exit, намеренно: разбор обязан быть
+    проверяемым без убийства собственного процесса — иначе кейс самопроверки
+    на разбор валил бы интерпретатор вместо того, чтобы поймать отказ.
+    Убивает процесс не разбор, а обёртка уровня модуля.
+    """
+
+
+def _env_positive_int(name, default):
+    """Целое ≥ 1 из окружения, иначе _EnvValueError.
+
+    Принимается ТОЛЬКО десятичное целое ≥ 1 после strip(). Всё остальное —
+    пустая строка, `abc`, `30s`, `3.5`, `0`, `-1`, `0x10`, `1_0` —
+    отвергается. int() здесь не годится: он глотает `1_0` как 10, знак `+`,
+    юникод-цифры и окружающие пробелы — то есть тихо принимал бы значения,
+    которых оператор не задавал. Поэтому форма проверяется явным
+    `[0-9]+` по ASCII, и лишь потом переводится в число.
+
+    Верхнего предела нет намеренно: большой интервал — законный выбор
+    оператора, а выдуманный потолок менял бы смысл настройки.
+    """
+    cleaned = os.environ.get(name, default).strip()
+    if not re.fullmatch(r"[0-9]+", cleaned):
+        raise _EnvValueError("ожидается целое число ≥ 1")
+    value = int(cleaned)
+    if value < 1:
+        raise _EnvValueError("ожидается целое число ≥ 1")
+    return value
+
+
+def _watch_fatal_line(name, raw, reason):
+    """Одна строка отказа: значение как задано, но без права разорвать поток.
+
+    Значение печатается как задал оператор, но перевод строки внутри него
+    заменяется пробелом (иначе одна кривая переменная расклеила бы строку
+    события на две у потребителя), а длина обрезается до 80 символов —
+    диагностики хватает, а забитый мусором поток нет.
+    """
+    shown = str(raw).replace("\n", " ").replace("\r", " ")
+    if len(shown) > 80:
+        shown = shown[:80]
+    return f"WATCH_FATAL {name}={shown} — {reason}"
+
+
+def _load_positive_int_or_die(name, default):
+    """Разбор переменной на уровне модуля: отказ громкий и в поток потребителя.
+
+    Отказ уходит в fd 1 — тот же дескриптор, куда наблюдатель пишет свои
+    события, — и процесс завершается кодом 2. Никакой тихой подстановки
+    значения по умолчанию: оператор задал настройку, наблюдатель её не
+    понял — это отказ, а не повод молча решить за него. Тихая подстановка
+    дала бы ровно ту слепоту, от которой уходит этот файл: наблюдатель, не
+    делающий того, что просили, но внешне живой.
+    """
+    try:
+        return _env_positive_int(name, default)
+    except _EnvValueError as exc:
+        raw = os.environ.get(name, default)
+        os.write(
+            1,
+            (_watch_fatal_line(name, raw, str(exc)) + "\n").encode(
+                "utf-8", "replace"
+            ),
+        )
+        sys.exit(2)
+
+
 REPO = "selftest/selftest" if "--self-test" in sys.argv else ""
-INTERVAL = int(os.environ.get("INTERVAL", "30"))
+INTERVAL = _load_positive_int_or_die("INTERVAL", "30")
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
 # Потолок множеств анти-спама: сброс лучше неограниченного роста в процессе,
 # который живёт сутками.
@@ -204,8 +273,8 @@ _PR_LIMIT = 200
 # более медленном канале уже на двадцати. Ценой был бы не сбой, а слепота:
 # GhError на каждом опросе, и этот PR никогда не попал бы под наблюдение.
 # Короткий лимит для остальных вызовов сохранён намеренно — быстрый отказ.
-_GH_TIMEOUT = int(os.environ.get("GH_TIMEOUT", "20"))
-_GH_TIMEOUT_PAGINATED = int(os.environ.get("GH_TIMEOUT_PAGINATED", "120"))
+_GH_TIMEOUT = _load_positive_int_or_die("GH_TIMEOUT", "20")
+_GH_TIMEOUT_PAGINATED = _load_positive_int_or_die("GH_TIMEOUT_PAGINATED", "120")
 _PR_FIELDS = "number,title,labels,reviewDecision"
 _PR_FIELDS_NO_REVIEW = "number,title,labels"
 _UNKNOWN_FIELD_STDERR = "unknown json field"
@@ -2556,6 +2625,94 @@ def self_test():
         globals()["_repo_from_env"] = original_repo_from_env
         globals()["_detect_repo"] = original_detect_repo
         globals()["REPO"] = original_repo
+
+        # --- Разбор числовых переменных окружения (раунд 25) ---
+        # _env_positive_int поднимает исключение вместо выхода из процесса
+        # именно для того, чтобы форму можно было проверить здесь напрямую,
+        # не убивая интерпретатор. Имя заведомо отсутствует в окружении, а
+        # проверяемое значение подаётся как default — так один и тот же кейс
+        # заодно доказывает, что при отсутствии переменной берётся default.
+        _ABSENT = "_PRW_SELFTEST_ABSENT_VAR_"
+
+        def _env_rejects(value):
+            try:
+                _env_positive_int(_ABSENT, value)
+                return False
+            except _EnvValueError:
+                return True
+
+        check(
+            "env-parse-rejects-non-positive-int",
+            _ABSENT not in os.environ
+            and all(_env_rejects(v) for v in
+                    ("", "abc", "30s", "3.5", "0", "-1", "0x10", "1_0", "+5")),
+        )
+        check(
+            "env-parse-accepts-positive-int",
+            _env_positive_int(_ABSENT, "1") == 1
+            and _env_positive_int(_ABSENT, "30") == 30
+            and _env_positive_int(_ABSENT, " 45 ") == 45
+            and _env_positive_int(_ABSENT, "3600") == 3600,
+        )
+        # Значение по умолчанию берётся именно тогда, когда переменной в
+        # окружении нет — отдельным утверждением, а не как побочный эффект.
+        check(
+            "env-parse-uses-default-when-absent",
+            _ABSENT not in os.environ
+            and _env_positive_int(_ABSENT, "30") == 30,
+        )
+
+        # Проводка, а не логика: сегодняшний дефект был в том, что причина
+        # уходила не в тот поток. Кейс на разбор этого не доказал бы — нужен
+        # запуск самого скрипта подпроцессом. Отказ случается на разборе
+        # переменной уровня модуля (при импорте), поэтому процесс завершается
+        # ещё до самопроверки. Три переменные покрыты по отдельности: дефект
+        # был одинаков в трёх местах, и кейс на одно оставил бы два слепыми.
+        # original_subprocess — настоящий модуль, независимо от подмен выше.
+        _wiring = (
+            ("INTERVAL", "0"),
+            ("GH_TIMEOUT", "abc"),
+            ("GH_TIMEOUT_PAGINATED", "-5"),
+        )
+        for _var, _bad in _wiring:
+            _child_env = dict(os.environ)
+            # Прочие числовые переменные — чистый default, чтобы отказ был
+            # однозначно приписан именно _var, а не соседней переменной.
+            for _other, _ in _wiring:
+                _child_env.pop(_other, None)
+            _child_env[_var] = _bad
+            _proc = original_subprocess.run(
+                [sys.executable, __file__, "--self-test"],
+                env=_child_env,
+                capture_output=True,
+                timeout=30,
+            )
+            _expected = (
+                "WATCH_FATAL " + _var + "=" + _bad
+                + " — ожидается целое число ≥ 1"
+            )
+            check(
+                "env-wiring-subprocess-" + _var,
+                _proc.returncode == 2
+                and _proc.stdout.decode("utf-8", "replace").strip() == _expected
+                and _proc.stderr == b"",
+            )
+
+        # Форма строки отказа: перевод строки внутри значения не разрывает
+        # событие (у потребителя ровно одна строка), а длинное значение
+        # обрезается до 80 символов — диагностики хватает, поток не забит.
+        _nl_line = _watch_fatal_line("INTERVAL", "1\n2\r3", "r")
+        check(
+            "env-fatal-line-collapses-newlines",
+            "\n" not in _nl_line
+            and "\r" not in _nl_line
+            and _nl_line == "WATCH_FATAL INTERVAL=1 2 3 — r",
+        )
+        _long_line = _watch_fatal_line("INTERVAL", "y" * 200, "r")
+        check(
+            "env-fatal-line-truncates-to-80",
+            _long_line == "WATCH_FATAL INTERVAL=" + "y" * 80 + " — r",
+        )
     except Exception as e:
         results.append((f"unexpected: {type(e).__name__}: {e}", False))
     finally:
