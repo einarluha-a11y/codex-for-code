@@ -6,9 +6,13 @@ name: Codex Review
 # затем раскатывай в потребителей (не наоборот).
 #
 # Закалённые фичи (все — детерминированный контроль ВНУТРИ самого CI):
-#   • guard-шаг: без секрета OPENAI_API_KEY job остаётся ЗЕЛЁНЫМ (а не красным) —
-#     чтобы codex можно было сделать required check, не ломая репозитории/форки
-#     без ключа (в т.ч. сам этот апстрим-репозиторий, где секрета нет).
+#   • guard-шаг + честный исход: без секрета OPENAI_API_KEY ревью НЕ выполняется,
+#     и это публикуется как check-run `codex-review-result` с conclusion=NEUTRAL
+#     (НЕ success — зелёный без реальной проверки был бы false green, Pitfalls
+#     P1/P9). Neutral не блокирует merge и не красит job красным, но и не врёт,
+#     что ревью прошло. Реальная ошибка ревью (сеть/лимит/модель) → conclusion=
+#     failure. Успешное/trivial-ревью → success. См. шаг «Publish codex check-run
+#     conclusion» ниже (job-статус YAML не умеет neutral — только Checks REST API).
 #   • SHA-pin: все actions запинены по коммит-SHA (supply-chain gate — тег @vN
 #     подменяем, SHA нет).
 #   • concurrency: новый push в PR отменяет предыдущее ревью того же PR (иначе
@@ -42,6 +46,7 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  checks: write
 
 jobs:
   codex:
@@ -58,6 +63,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      checks: write
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -174,4 +180,60 @@ jobs:
                 '',
                 '<sub>Автоматическое ревью от OpenAI Codex (gpt-5-mini, effort=medium). Если не согласен — обоснуй в треде и поставь метку `needs-human`.</sub>'
               ].join('\n')
+            });
+
+      # ─────────────────────────────────────────────────────────────────────
+      # Публикуем check-run с ЧЕСТНЫМ исходом. Job-статус на уровне YAML не
+      # умеет conclusion=neutral, а «зелёный job без ключа» = ложный успех
+      # (Pitfalls P1/P9: false green хуже red — молча снимает сомнение).
+      # Поэтому исход различаем детерминированно через Checks REST API:
+      #   • нет OPENAI_API_KEY → conclusion=neutral (ревью НЕ выполнялось);
+      #   • ревью реально упало (сеть/лимит/модель) → conclusion=failure;
+      #   • ревью прошло / trivial docs-only → conclusion=success.
+      # output.title во ВСЕХ ветках непустой — иначе исход нечитаем.
+      # always(): исход публикуется даже когда шаг Codex упал/отменён.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Publish codex check-run conclusion
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TRIVIAL: ${{ steps.check.outputs.trivial }}
+          GUARD_SKIP: ${{ steps.guard.outputs.skip }}
+          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+        with:
+          script: |
+            const trivial = process.env.TRIVIAL === 'true';
+            const guardSkip = process.env.GUARD_SKIP === 'true';
+            const codexOutcome = process.env.CODEX_OUTCOME; // success|failure|cancelled|skipped|''
+
+            let conclusion, title, summary;
+            if (guardSkip) {
+              // Ключа нет — ревью НЕ выполнялось. НЕ success (это был бы false green).
+              conclusion = 'neutral';
+              title = 'Codex review not performed: OPENAI_API_KEY not set in repository secrets';
+              summary = 'OPENAI_API_KEY отсутствует в секретах репозитория — семантическое ревью не запускалось. Исход neutral (не success), чтобы не имитировать зелёный без реальной проверки.';
+            } else if (trivial) {
+              // docs-only: Codex намеренно не звали, но проверять нечего.
+              conclusion = 'success';
+              title = 'Codex review skipped: docs-only PR (trivial)';
+              summary = 'PR затрагивает только документацию — Codex не вызывался осознанно (экономия), код на ревью отсутствует.';
+            } else if (codexOutcome === 'success') {
+              conclusion = 'success';
+              title = 'Codex review completed';
+              summary = 'Семантическое ревью Codex выполнено успешно.';
+            } else {
+              // failure / cancelled / скип по неожиданной причине — ревью не прошло.
+              conclusion = 'failure';
+              title = 'Codex review failed: ' + (codexOutcome || 'unknown error');
+              summary = 'Шаг Codex review завершился со статусом `' + (codexOutcome || 'unknown') + '` (ошибка сети/лимита/модели или отмена). Ревью НЕ пройдено — исход failure.';
+            }
+
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'codex-review-result',
+              head_sha: context.payload.pull_request.head.sha,
+              status: 'completed',
+              conclusion,
+              output: { title, summary },
             });
