@@ -1979,8 +1979,18 @@ def self_test():
                 # После вынесения формата в _STOP_EVENT_FMT продовый вызов —
                 # `_STOP_EVENT_FMT.format(...)`; принимаем и прямой литерал
                 # WATCH_STOPPED на случай отката рефактора.
-                _first_arg_ok = ("_STOP_EVENT_FMT" in _arg_src
-                                 or "WATCH_STOPPED" in _arg_src)
+                #
+                # Проверка идёт по НАЧАЛУ выражения, а не вхождением подстроки.
+                # Вхождение пропускало бы чужое событие, внутри которого имя
+                # формата упомянуто, — например
+                # `_emit_raw(f"PR_COMMENT #1 {_STOP_EVENT_FMT}")`: единственный
+                # вызов, подстрока на месте, а в fd 1 уходит тело комментария,
+                # против чего инвариант и написан. Закреплено откатом 6.
+                _stripped = _arg_src.lstrip("fF").lstrip("\"'")
+                _first_arg_ok = (
+                    _arg_src.startswith("_STOP_EVENT_FMT.format(")
+                    or _stripped.startswith("WATCH_STOPPED")
+                )
         check("emit-raw-has-single-production-call-site",
               len(_emit_raw_calls) == 1 and _first_arg_ok)
 
