@@ -33,6 +33,7 @@
 import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -41,14 +42,65 @@ import traceback
 from datetime import datetime, timezone
 
 
-def _detect_repo():
-    """Auto-detect <owner>/<repo> from current git remote via gh CLI.
+def _repo_from_remote_url(url):
+    """Извлечь owner/name из адреса git-remote без подпроцессов и сети.
 
-    Модуль уже импортировал subprocess сверху; локальный импорт здесь был
-    лишним и вдобавок делал функцию непроверяемой — self-test подменяет
-    ГЛОБАЛЬНЫЙ subprocess, а локальный импорт возвращал настоящий модуль и
-    полез бы в сеть.
+    Поддерживает формы github.com:
+      git@github.com:owner/repo.git   — SCP-like (с .git и без)
+      ssh://git@github.com/owner/repo.git
+      https://github.com/owner/repo.git  (http://, с логином)
+      git://github.com/owner/repo.git
+
+    Хост, отличный от github.com (GitHub Enterprise, GitLab и т.п.),
+    → пустая строка. Мусорный ввод → пустая строка, без исключений.
     """
+    if not url or not isinstance(url, str):
+        return ""
+    url = url.strip()
+    if not url:
+        return ""
+    # SCP-like: git@github.com:owner/repo.git
+    m = re.match(r'^git@([^:]+):(.+)$', url)
+    if m:
+        host, path = m.group(1), m.group(2)
+    else:
+        # URL-like: scheme://[user@]host/path
+        m = re.match(r'^(?:https?|git|ssh)://(?:[^@/]+@)?([^/]+)/(.+)$', url)
+        if not m:
+            return ""
+        host, path = m.group(1), m.group(2)
+    if host != "github.com":
+        return ""
+    path = path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not _repo_is_valid(path):
+        return ""
+    return path
+
+
+def _detect_repo():
+    """Auto-detect <owner>/<repo> сначала из адреса git-remote, затем через gh.
+
+    Прежний единственный путь — `gh repo view --json nameWithOwner` — GraphQL:
+    при исчерпанном лимите наблюдатель падал на старте, до первой строки
+    stdout. Адрес origin лежит на диске, сеть и лимит не нужны. gh остаётся
+    запасным путём для сред, где origin не github.com, а gh настроен.
+
+    Оба пути ходят через ГЛОБАЛЬНЫЙ subprocess, а не через локальный импорт:
+    self-test подменяет глобал, и локальный импорт обошёл бы подмену.
+    """
+    try:
+        out = subprocess.run(
+            ['git', 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            parsed = _repo_from_remote_url(out.stdout.strip())
+            if parsed:
+                return parsed
+    except Exception:
+        pass
     try:
         out = subprocess.run(
             ['gh', 'repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
@@ -58,7 +110,10 @@ def _detect_repo():
             return out.stdout.strip()
     except Exception:
         pass
-    raise RuntimeError("Cannot detect repo: set REPO env var or run inside a gh-authorized git repo.")
+    raise RuntimeError(
+        "Cannot detect repo: set REPO env var, ensure origin is a github.com"
+        " remote, or run inside a gh-authorized git repo."
+    )
 
 
 # Определение репозитория НЕ делается на импорте. Раньше здесь стоял вызов
@@ -1678,6 +1733,83 @@ def self_test():
             detected = f"ошибка: {type(e).__name__}"
         check("detect-repo-uses-patched-subprocess", detected == "fake/repo")
         globals()["REPO"] = original_repo
+        globals()["subprocess"] = original_subprocess
+
+        # --- Определение репозитория предпочитает git remote (без GraphQL) ---
+        # Если git remote get-url origin возвращает адрес github.com — gh
+        # не должен вызываться вообще: ни сети, ни лимита.
+        _git_cmds = []
+
+        class _GitPreferSubprocess:
+            def run(self, args, **_kw):
+                _git_cmds.append(list(args))
+                if args[0] == 'git':
+                    return _Result(
+                        0,
+                        "git@github.com:einarluha-a11y/codex-for-code.git\n",
+                        "",
+                    )
+                return _Result(1, "", "gh: not called")
+
+        globals()["subprocess"] = _GitPreferSubprocess()
+        _git_detected = None
+        try:
+            _git_detected = _detect_repo()
+        except BaseException as _e:
+            _git_detected = f"ошибка: {type(_e).__name__}"
+        _gh_not_called = not any(c[0] == 'gh' for c in _git_cmds)
+        check(
+            "detect-repo-prefers-git-remote",
+            _git_detected == "einarluha-a11y/codex-for-code" and _gh_not_called,
+        )
+        globals()["subprocess"] = original_subprocess
+
+        # _repo_from_remote_url разбирает все допустимые формы адреса github.com
+        # и отвергает всё остальное.
+        check(
+            "detect-repo-parses-url-forms",
+            _repo_from_remote_url("git@github.com:owner/repo.git") == "owner/repo"
+            and _repo_from_remote_url("git@github.com:owner/repo") == "owner/repo"
+            and _repo_from_remote_url("ssh://git@github.com/owner/repo.git") == "owner/repo"
+            and _repo_from_remote_url("https://github.com/owner/repo.git") == "owner/repo"
+            and _repo_from_remote_url("http://github.com/owner/repo.git") == "owner/repo"
+            and _repo_from_remote_url("https://user@github.com/owner/repo.git") == "owner/repo"
+            and _repo_from_remote_url("git://github.com/owner/repo.git") == "owner/repo"
+            and _repo_from_remote_url("https://github.example.com/o/r.git") == ""
+            and _repo_from_remote_url("") == ""
+            and _repo_from_remote_url("ерунда") == "",
+        )
+
+        # git remote недоступен — функция обязана откатиться на gh.
+        class _GitFailGhSuccessSubprocess:
+            def run(self, args, **_kw):
+                if args[0] == 'git':
+                    return _Result(1, "", "fatal: no remote 'origin'")
+                return _Result(0, "fallback/repo\n", "")
+
+        globals()["subprocess"] = _GitFailGhSuccessSubprocess()
+        _fb_detected = None
+        try:
+            _fb_detected = _detect_repo()
+        except BaseException as _e:
+            _fb_detected = f"ошибка: {type(_e).__name__}"
+        check("detect-repo-falls-back-to-gh", _fb_detected == "fallback/repo")
+        globals()["subprocess"] = original_subprocess
+
+        # Оба источника недоступны — RuntimeError.
+        class _BothFailSubprocess:
+            def run(self, args, **_kw):
+                return _Result(1, "", "error")
+
+        globals()["subprocess"] = _BothFailSubprocess()
+        _both_raised = None
+        try:
+            _detect_repo()
+        except RuntimeError as _e:
+            _both_raised = _e
+        except BaseException:
+            pass
+        check("detect-repo-raises-when-both-fail", _both_raised is not None)
         globals()["subprocess"] = original_subprocess
 
         # Пустое/пробельное значение переменной окружения обязано быть
