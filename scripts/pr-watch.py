@@ -66,9 +66,11 @@ def _repo_from_env(env=None):
     громкого отказа на старте. После нормализации такой ввод неотличим от
     отсутствующего и уходит в авто-определение.
 
-    Отдельной функцией — чтобы это поведение было проверяемым: выражение
-    на уровне модуля вычисляется один раз на импорте и в self-test уже не
-    доступно.
+    Чтение окружения по-прежнему происходит на импорте — это намеренно:
+    REPO нужен до входа в main(). Отдельной функцией вынесена не сама
+    ленивость, а ПРОВЕРЯЕМОСТЬ: результат импортного вычисления уже лежит
+    в глобальной REPO, и убедиться, что пробельный ввод отброшен, по нему
+    нельзя — а вызвать функцию с подставленным окружением можно.
     """
     source = os.environ if env is None else env
     return (source.get("REPO") or "").strip()
@@ -558,10 +560,18 @@ def handle_signal(signum, _frame):
     # REPO здесь — штатное состояние, а не «не должно случиться». Токен
     # `repo=` без значения ломал бы разбор строки события по парам
     # key=value у потребителя; форма совпадает с той, что печатает run().
-    emit(
-        f"WATCH_STOPPED repo={REPO or '(unknown)'} "
-        f"signal={signal.Signals(signum).name}"
-    )
+    # Имя сигнала берётся под страховкой. Это не про наблюдавшийся сбой:
+    # обработчик стоит на SIGTERM и SIGINT, и ядро передаёт сюда только их,
+    # так что Signals(signum) в проде не падает. Но handle_signal — ПОСЛЕДНЕЕ
+    # место, которое печатает событие: исключение здесь означает ровно ту
+    # тихую смерть, против которой писан весь раунд. Страховка стоит трёх
+    # строк и снимает целый класс: чужой signum (функцию позовут напрямую или
+    # повесят на новый сигнал) и окружение, где `signal` подменён.
+    try:
+        name = signal.Signals(signum).name
+    except (ValueError, AttributeError):
+        name = f"SIG{signum}"
+    emit(f"WATCH_STOPPED repo={REPO or '(unknown)'} signal={name}")
     sys.exit(0)
 
 
@@ -1338,6 +1348,23 @@ def self_test():
         class _StopLoop(Exception):
             pass
 
+        class _SignalName:
+            """Мимикрия signal.Signals: объект с .name, ValueError на чужой.
+
+            Прежняя заглушка отдавала голое число, у которого нет .name.
+            После появления страховки в handle_signal это стало опасно:
+            фейк молча уводил бы КАЖДЫЙ вызов в аварийную ветку, и
+            регрессия основной прошла бы незамеченной. Заглушка обязана
+            повторять интерфейс подменяемого, иначе она проверяет не то.
+            """
+
+            _NAMES = {15: "SIGTERM", 2: "SIGINT"}
+
+            def __init__(self, value):
+                if value not in self._NAMES:
+                    raise ValueError(value)
+                self.name = self._NAMES[value]
+
         class _FakeSignal:
             SIGTERM = 15
             SIGINT = 2
@@ -1348,7 +1375,7 @@ def self_test():
 
             @staticmethod
             def Signals(value):
-                return value
+                return _SignalName(value)
 
         class _FakeTime:
             @staticmethod
@@ -1435,7 +1462,7 @@ def self_test():
 
             @staticmethod
             def Signals(value):
-                return value
+                return _SignalName(value)
 
         class _OrderProbeSubprocess:
             seen_at_call = None
@@ -1574,6 +1601,47 @@ def self_test():
         check(
             "signal-event-normalizes-empty-repo",
             captured[start:] == ["WATCH_STOPPED repo=(unknown) signal=SIGTERM"],
+        )
+
+        # Заглушка сигналов сверяется с НАСТОЯЩИМ модулем, а не сама с
+        # собой: расхождение интерфейса — тихая порча всех кейсов, которые
+        # через неё идут. Ground truth здесь доступен даром, поэтому
+        # верность двойника проверяется, а не декларируется.
+        def _stub_signal_name(value):
+            # Доступ обёрнут намеренно: без обёртки заглушка, вернувшая
+            # голое число, поднимает AttributeError прямо в выражении
+            # check() — провал выходит безымянным и обрывает остальные
+            # кейсы вместо того, чтобы назвать себя.
+            try:
+                return _FakeSignal.Signals(value).name
+            except Exception as e:
+                return f"нет .name ({type(e).__name__})"
+
+        check(
+            "fake-signal-mimics-real-interface",
+            _stub_signal_name(_FakeSignal.SIGTERM)
+            == original_signal.Signals(original_signal.SIGTERM).name
+            and _stub_signal_name(_FakeSignal.SIGINT)
+            == original_signal.Signals(original_signal.SIGINT).name,
+        )
+
+        # Обработчик — последнее, что печатает событие. Неизвестный номер
+        # сигнала не должен превращать финальное событие в исключение:
+        # тогда поток оборвался бы молча, ровно тот класс, что закрывался
+        # всем раундом.
+        globals()["REPO"] = "owner/name"
+        start = len(captured)
+        raised = None
+        try:
+            handle_signal(9999, None)
+        except SystemExit:
+            pass
+        except BaseException as e:
+            raised = type(e).__name__
+        check(
+            "signal-event-survives-unknown-signal-number",
+            raised is None
+            and captured[start:] == ["WATCH_STOPPED repo=owner/name signal=SIG9999"],
         )
         globals()["REPO"] = original_repo
     except Exception as e:
