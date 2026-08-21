@@ -368,11 +368,28 @@ def _emit_raw(line):
     AttributeError гасится except ниже — ПОСЛЕДНЕЕ событие пропадает
     молча, ровно тот исход, против которого эта функция и написана.
     Держится кейсом emit-raw-survives-none-original-stdout.
+
+    Провал самой записи больше не молчит. Замер: при закрытом fd 1 вызов
+    падает с OSError EBADF, а fd 2 в тот же момент жив и принимает
+    строку. Раньше событие здесь исчезало бесследно, хотя единственный
+    оставшийся канал работал. Теперь в fd 2 уходит причина и САМО
+    событие: оператор в логе видит не факт потери, а потерянное
+    содержимое. Граница названа прямо — это НЕ доставка потребителю, он
+    читает stdout, и для него событие всё равно потеряно; это сохранение
+    улики в выжившем канале. Держится кейсом
+    emit-raw-falls-back-to-stderr-when-fd1-broken.
     """
     try:
         os.write(1, (line + "\n").encode("utf-8", "replace"))
-    except Exception:
-        pass
+    except Exception as exc:
+        try:
+            os.write(
+                2,
+                ("PR_WATCH_EMIT_FALLBACK %s: %s | %s\n"
+                 % (type(exc).__name__, exc, line)).encode("utf-8", "replace"),
+            )
+        except Exception:
+            pass
 
 
 def _force_utf8_stdout():
@@ -1840,6 +1857,37 @@ def self_test():
         check(
             "emit-raw-survives-none-original-stdout",
             payload == "WATCH_STOPPED repo=owner/name signal=SIGTERM\n",
+        )
+        globals()["_emit_raw"] = captured.append
+
+        # Провал самой os.write(1, …) не имеет права быть молчаливым:
+        # событие уходит в выживший fd 2 вместе с причиной. Работает
+        # настоящий _emit_raw, fd 1 закрыт по-настоящему — приём идёт с
+        # fd 2. Порядок операций важен: ВСЕ дескрипторы берутся ДО
+        # закрытия fd 1, иначе os.pipe() займёт освободившийся номер.
+        globals()["_emit_raw"] = original_emit_raw
+        saved_out_fd = os.dup(1)
+        read_err_fd, write_err_fd = os.pipe()
+        saved_err_fd = os.dup(2)
+        os.dup2(write_err_fd, 2)
+        os.close(1)
+        try:
+            _emit_raw("WATCH_STOPPED repo=owner/name signal=SIGTERM")
+        finally:
+            os.dup2(saved_out_fd, 1)
+            os.close(saved_out_fd)
+            os.dup2(saved_err_fd, 2)
+            os.close(saved_err_fd)
+            os.close(write_err_fd)
+        payload = os.read(read_err_fd, 4096).decode("utf-8", "replace")
+        os.close(read_err_fd)
+        check(
+            "emit-raw-falls-back-to-stderr-when-fd1-broken",
+            payload.startswith("PR_WATCH_EMIT_FALLBACK ")
+            and "OSError" in payload
+            and payload.rstrip("\n").endswith(
+                "| WATCH_STOPPED repo=owner/name signal=SIGTERM"
+            ),
         )
         globals()["_emit_raw"] = captured.append
 
