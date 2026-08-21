@@ -869,9 +869,18 @@ def run():
         # существует, и в нём SIGINT приходит сюда исключением, — но само
         # исключение пробрасывается, чтобы интерпретатор завершился как
         # положено. Форма события совпадает с сигнальным путём.
+        # Печать здесь идёт обычным emit, и это осознанно. Блок except
+        # выполняется ПОСЛЕ раскрутки стека: запись в буфер уже вышла с
+        # ошибкой, замок отпущен, реентрантного срыва тут нет — в отличие
+        # от обработчика сигнала, который работает ВЛОЖЕННО, пока замок
+        # держится (см. _emit_raw). Замер настоящим Ctrl-C: 995 прерываний
+        # внутри незавершённой записи, 995 напечатано, 0 срывов. Плюс
+        # порядок: emit кладёт событие ПОСЛЕ прерванного, а os.write
+        # обогнал бы его. Держится кейсами except-*-emits-after-unwound-write.
         emit(f"WATCH_STOPPED repo={REPO or '(unknown)'} signal=SIGINT")
         raise
     except Exception as e:
+        # Тот же разбор, что и веткой выше: здесь стек уже раскручен.
         emit(f"WATCH_ERROR fatal: {type(e).__name__}: {e}{_crash_site(e)}")
         emit(f"WATCH_STOPPED repo={REPO or '(unknown)'} signal=EXCEPTION")
         return 1
@@ -1773,6 +1782,84 @@ def self_test():
             and payload == "WATCH_STOPPED repo=owner/name signal=SIGTERM\n",
         )
         globals()["_emit_raw"] = captured.append
+
+        # Ветки except в run() печатают обычным emit — и это верно. Кейсы
+        # держат вывод машинно: исключение поднимается ИЗНУТРИ незавершённой
+        # записи в буфер, раскручивает стек, и блок except печатает в тот же
+        # буфер. Если бы класс совпадал с сигнальным, здесь был бы
+        # RuntimeError о повторном входе; его нет. Событие ловится с fd 1,
+        # поэтому проверяется и доставка, а не только отсутствие исключения.
+        # _emit_raw при этом остаётся подменённым: подмена emit на него в
+        # этих ветках уронит кейсы — выбор зафиксирован намеренно.
+        globals()["emit"] = original_emit
+        globals()["REPO"] = "owner/name"
+
+        def _run_with_broken_stdout(main_stub):
+            state = {}
+
+            class _RaiseMidWrite(io.RawIOBase):
+                def writable(self):
+                    return True
+
+                def write(self, chunk):
+                    if not state.get("fired"):
+                        state["fired"] = True
+                        raise state["error"]
+                    os.write(1, chunk)
+                    return len(chunk)
+
+            state["error"] = main_stub.error
+            globals()["main"] = main_stub
+            saved_fd = os.dup(1)
+            read_fd, write_fd = os.pipe()
+            real_stdout = sys.stdout
+            os.dup2(write_fd, 1)
+            try:
+                sys.stdout = io.TextIOWrapper(io.BufferedWriter(_RaiseMidWrite()))
+                try:
+                    state["rc"] = run()
+                except BaseException as e:
+                    state["raised"] = type(e).__name__
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+            finally:
+                sys.stdout = real_stdout
+                os.dup2(saved_fd, 1)
+                os.close(saved_fd)
+                os.close(write_fd)
+            state["payload"] = os.read(read_fd, 8192).decode("utf-8", "replace")
+            os.close(read_fd)
+            return state
+
+        def _main_interrupted():
+            print("основное событие", flush=True)
+            return 0
+
+        _main_interrupted.error = KeyboardInterrupt()
+        ki = _run_with_broken_stdout(_main_interrupted)
+        check(
+            "except-keyboardinterrupt-emits-after-unwound-write",
+            ki.get("raised") == "KeyboardInterrupt"
+            and "WATCH_STOPPED repo=owner/name signal=SIGINT\n" in ki["payload"],
+        )
+
+        def _main_crashed():
+            print("основное событие", flush=True)
+            return 0
+
+        _main_crashed.error = ValueError("сбой записи")
+        crash = _run_with_broken_stdout(_main_crashed)
+        check(
+            "except-exception-emits-after-unwound-write",
+            crash.get("raised") is None
+            and crash.get("rc") == 1
+            and "WATCH_ERROR fatal: ValueError: сбой записи" in crash["payload"]
+            and "WATCH_STOPPED repo=owner/name signal=EXCEPTION\n" in crash["payload"],
+        )
+        globals()["emit"] = captured.append
+        globals()["main"] = original_main
 
         # Переменная окружения читается ВНУТРИ main(). Была раздвоенная
         # политика: переменная на импорте, авто-определение в main. Значение,
