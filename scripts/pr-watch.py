@@ -836,9 +836,11 @@ def main():
         emit("WATCH_STOPPED repo=(unknown) signal=BAD_REPO")
         return 1
 
-    # pr_number -> {"last_comment_key": (datetime, (kind, value)),
+    # pr_number -> {"last_comment_key": (datetime, (kind, value)) | None,
     #               "ci": str, "labels": str, "review": str}
     # Второй элемент ключа — разряд из _norm_id_key, а не голый int.
+    # None означает «bootstrap комментариев не удался»: на первом успешном
+    # опросе watermark перенимается без эмита.
     known = {}
     bootstrapped = False
 
@@ -888,13 +890,20 @@ def main():
                 emit(f"PR_OPENED #{n} | {title}")
                 try:
                     cs = list_comments(n)
-                except GhError:
-                    cs = []
-                known[n] = {
-                    "last_comment_key": max(
+                    wm = max(
                         (comment_key(c) for c in cs),
                         default=(_EPOCH, _norm_id_key(0)),
-                    ),
+                    )
+                except GhError as e:
+                    emit(f"WATCH_ERROR comments #{n}: {e}")
+                    # Watermark неизвестен. На первом успешном опросе он будет
+                    # перенят без эмита. Цена: комментарии, пришедшие внутри
+                    # окна сбоя, будут пропущены один раз — осознанный размен:
+                    # он строго лучше повтора всей истории (та же семантика,
+                    # что принята при начальном bootstrap без ложных PR_OPENED).
+                    wm = None
+                known[n] = {
+                    "last_comment_key": wm,
                     "ci": "",
                     "labels": labels_str(current_by_num[n]),
                     "review": review_str(current_by_num[n]),
@@ -950,27 +959,39 @@ def main():
             try:
                 cs = list_comments(n)
                 last = state["last_comment_key"]
-                new = [c for c in cs if comment_key(c) > last]
-                if new:
-                    # cs уже отсортирован comment_key'ем в list_comments.
-                    for c in new:
-                        # Безопасное извлечение: KeyError здесь не GhError и
-                        # пролетел бы мимо except ниже, уронив весь watcher.
-                        user = c.get("user")
-                        if not isinstance(user, dict):
-                            user = {}
-                        author = user.get("login") or "?"
-                        body = c.get("body") or ""
-                        if not isinstance(body, str):
-                            body = str(body)
-                        body = body.replace("\n", " ").replace("\r", " ")
-                        if len(body) > 200:
-                            body = body[:200] + "…"
-                        emit(
-                            f"PR_COMMENT #{n} by {author} "
-                            f"[id={c.get('id')}]: {body}"
+                if last is None:
+                    # Первый успешный опрос после сбоя bootstrap нового PR:
+                    # перенимаем текущий максимум без эмита — история не
+                    # повторяется. Комментарии, пришедшие в окне сбоя,
+                    # пропускаются один раз (названная цена).
+                    state["last_comment_key"] = max(
+                        (comment_key(c) for c in cs),
+                        default=(_EPOCH, _norm_id_key(0)),
+                    )
+                else:
+                    new = [c for c in cs if comment_key(c) > last]
+                    if new:
+                        # cs уже отсортирован comment_key'ем в list_comments.
+                        for c in new:
+                            # Безопасное извлечение: KeyError здесь не GhError
+                            # и пролетел бы мимо except ниже, уронив watcher.
+                            user = c.get("user")
+                            if not isinstance(user, dict):
+                                user = {}
+                            author = user.get("login") or "?"
+                            body = c.get("body") or ""
+                            if not isinstance(body, str):
+                                body = str(body)
+                            body = body.replace("\n", " ").replace("\r", " ")
+                            if len(body) > 200:
+                                body = body[:200] + "…"
+                            emit(
+                                f"PR_COMMENT #{n} by {author} "
+                                f"[id={c.get('id')}]: {body}"
+                            )
+                        state["last_comment_key"] = max(
+                            comment_key(c) for c in cs
                         )
-                    state["last_comment_key"] = max(comment_key(c) for c in cs)
             except GhError as e:
                 emit(f"WATCH_ERROR comments #{n}: {e}")
 
@@ -1672,6 +1693,144 @@ def self_test():
         lines = one_iteration([{"number": 2, "title": "второй", "labels": []}])
         check("full-snapshot-still-closes",
               any(line == "PR_CLOSED #1" for line in lines))
+
+        # --- Bootstrap нового PR: отказ list_comments громкий, история не повторяется ---
+        # Раньше except GhError молчал и ставил watermark в (_EPOCH, _norm_id_key(0)):
+        # на следующем опросе ВСЯ история PR уезжала потребителю как новые события.
+
+        class _FakeTimeCounter:
+            """Заменяет _FakeTime: позволяет N итераций до остановки."""
+
+            def __init__(self, n):
+                self._remaining = n
+
+            def sleep(self, _):
+                if self._remaining <= 0:
+                    raise _StopLoop()
+                self._remaining -= 1
+
+        def run_iterations(gh_func, max_sleeps=0):
+            """Бутстрап на пустом списке, затем (max_sleeps + 1) итераций."""
+            _clear_warning_sets()
+            globals()["gh_json"] = gh_func
+            globals()["signal"] = _FakeSignal
+            globals()["time"] = _FakeTimeCounter(max_sleeps)
+            start = len(captured)
+            try:
+                main()
+            except _StopLoop:
+                pass
+            return captured[start:]
+
+        _OLD_C = {"id": 100, "created_at": "2024-01-01T00:00:00Z",
+                  "body": "old comment", "user": {"login": "alice"}}
+        _NEW_C = {"id": 200, "created_at": "2025-06-01T00:00:00Z",
+                  "body": "new comment", "user": {"login": "bob"}}
+
+        # Кейс 1: новый PR + GhError при чтении комментариев →
+        # поток несёт PR_OPENED И WATCH_ERROR (отказ громкий, а не молчание).
+        _pr_k1 = [0]
+        _api_k1 = [0]
+
+        def gh_k1(args):
+            if args[0] == "pr" and args[1] == "list":
+                _pr_k1[0] += 1
+                if _pr_k1[0] == 1:
+                    return []
+                return [{"number": 5, "title": "test-pr", "labels": []}]
+            if args[0] == "api":
+                _api_k1[0] += 1
+                if _api_k1[0] == 1:
+                    raise GhError("network timeout")
+                return []
+            return []
+
+        lines_k1 = run_iterations(gh_k1)
+        check("new-pr-comment-error-emits-watch-error",
+              any(line == "PR_OPENED #5 | test-pr" for line in lines_k1)
+              and any(line.startswith("WATCH_ERROR comments #5:")
+                      for line in lines_k1))
+
+        # Кейс 2: после двойного сбоя bootstrap (new-PR-block + comment-poll)
+        # следующий успешный опрос НЕ воспроизводит историю комментариев.
+        _pr_k2 = [0]
+        _api_k2 = [0]
+
+        def gh_k2(args):
+            if args[0] == "pr" and args[1] == "list":
+                _pr_k2[0] += 1
+                if _pr_k2[0] == 1:
+                    return []
+                return [{"number": 6, "title": "test-pr2", "labels": []}]
+            if args[0] == "api":
+                _api_k2[0] += 1
+                # Итерация 1: оба list_comments падают (new-PR-block и
+                # comment-poll — по одному вызову issues/pulls каждый, но
+                # GhError на issues обрывает pulls; итого два api-вызова).
+                if _api_k2[0] <= 2:
+                    raise GhError("timeout")
+                # Итерация 2: возвращаем старый комментарий.
+                if "issues" in args[-1]:
+                    return [_OLD_C]
+                return []
+            return []
+
+        lines_k2 = run_iterations(gh_k2, max_sleeps=1)
+        check("new-pr-comment-error-no-history-replay",
+              not any(line.startswith("PR_COMMENT #6") for line in lines_k2))
+
+        # Кейс 3: после перенятия watermark новые комментарии доходят.
+        # Итерация 1: оба list_comments падают — watermark остаётся None.
+        # Итерация 2: успешный опрос → watermark перенят без эмита.
+        # Итерация 3: новый комментарий → PR_COMMENT эмитится.
+        _pr_k3 = [0]
+        _api_k3 = [0]
+
+        def gh_k3(args):
+            if args[0] == "pr" and args[1] == "list":
+                _pr_k3[0] += 1
+                if _pr_k3[0] == 1:
+                    return []
+                return [{"number": 7, "title": "test-pr3", "labels": []}]
+            if args[0] == "api":
+                _api_k3[0] += 1
+                if _api_k3[0] <= 2:
+                    raise GhError("timeout")
+                # Итерация 2 (вызовы 3, 4): старый комментарий.
+                if _api_k3[0] == 3:
+                    return [_OLD_C]
+                if _api_k3[0] == 4:
+                    return []
+                # Итерация 3 (вызовы 5, 6): добавился новый.
+                if _api_k3[0] == 5:
+                    return [_OLD_C, _NEW_C]
+                return []
+            return []
+
+        lines_k3 = run_iterations(gh_k3, max_sleeps=2)
+        check("new-pr-comment-error-new-comment-arrives",
+              any(line.startswith("PR_COMMENT #7") and "bob" in line
+                  for line in lines_k3))
+
+        # Кейс 4 (регресс): при успешном bootstrap нового PR прежнее поведение
+        # не изменилось — старые комментарии не эмитятся как новые.
+        _pr_k4 = [0]
+
+        def gh_k4(args):
+            if args[0] == "pr" and args[1] == "list":
+                _pr_k4[0] += 1
+                if _pr_k4[0] == 1:
+                    return []
+                return [{"number": 8, "title": "test-pr4", "labels": []}]
+            if args[0] == "api":
+                if "issues" in args[-1]:
+                    return [_OLD_C]
+                return []
+            return []
+
+        lines_k4 = run_iterations(gh_k4, max_sleeps=0)
+        check("new-pr-success-no-old-comments-emitted",
+              not any(line.startswith("PR_COMMENT #8") for line in lines_k4))
 
         # --- Старт без репозитория: событие, а не молчаливая смерть ---
         # Раньше _detect_repo() звался на импорте и неподготовленная среда
