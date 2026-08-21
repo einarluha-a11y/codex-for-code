@@ -18,6 +18,7 @@
                                            определился) или EXCEPTION
                                            (необработанный сбой)
 """
+import io
 import json
 import os
 import signal
@@ -66,21 +67,44 @@ def _repo_from_env(env=None):
     громкого отказа на старте. После нормализации такой ввод неотличим от
     отсутствующего и уходит в авто-определение.
 
-    Чтение окружения по-прежнему происходит на импорте — это намеренно:
-    REPO нужен до входа в main(). Отдельной функцией вынесена не сама
-    ленивость, а ПРОВЕРЯЕМОСТЬ: результат импортного вычисления уже лежит
-    в глобальной REPO, и убедиться, что пробельный ввод отброшен, по нему
-    нельзя — а вызвать функцию с подставленным окружением можно.
+    Зовётся из main(), а не на импорте. Прежде окружение читалось при
+    импорте, и политика чтения REPO была двойной: переменная — рано,
+    авто-определение — поздно. Значение, выставленное после импорта
+    (обёртка, которая импортирует модуль и потом зовёт main()), молча
+    игнорировалось, а комментарий про ленивость расходился с кодом.
+    Теперь оба источника читаются в одной точке.
     """
     source = os.environ if env is None else env
     return (source.get("REPO") or "").strip()
 
 
-REPO = (
-    "selftest/selftest"
-    if "--self-test" in sys.argv
-    else _repo_from_env()
-)
+def _repo_is_valid(value):
+    """Форма `owner/name` — проверяется один раз на старте, а не на опросе.
+
+    Кривое значение (лишний пробел внутри, потерянный слэш, обрезанная
+    половина) не ломает вызов gh как таковой — `--repo` съедает его как
+    значение флага, инъекции здесь нет. Ломается другое: gh отвечает
+    отказом на КАЖДЫЙ опрос, и watcher живёт, ровно раз в INTERVAL печатая
+    невнятный WATCH_ERROR. Постоянная слепота вместо громкого отказа —
+    тот же класс, что и пробельный REPO выше.
+
+    Набор символов намеренно широкий: GitHub допускает точку в начале
+    (`.github` — очень частое имя), поэтому проверяется только алфавит и
+    наличие обеих половин. Более узкое правило отвергало бы существующие
+    репозитории, а отказ стартовать на живом имени хуже невнятной ошибки.
+    """
+    owner, sep, name = value.partition("/")
+    if not sep or not owner or not name:
+        return False
+    allowed = set(
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789._-"
+    )
+    return all(ch in allowed for ch in owner + name)
+
+
+REPO = "selftest/selftest" if "--self-test" in sys.argv else ""
 INTERVAL = int(os.environ.get("INTERVAL", "30"))
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
 # Потолок множеств анти-спама: сброс лучше неограниченного роста в процессе,
@@ -310,6 +334,35 @@ def labels_str(pr_obj):
 def emit(line):
     # Один print = одно событие. flush обязателен — без него Monitor не видит.
     print(line, flush=True)
+
+
+def _emit_raw(line):
+    """Событие одним системным вызовом, мимо буфера Python.
+
+    Нужно ровно одному месту — обработчику сигнала. print() туда не
+    годится, и это не теория: сигнал приходит между байткодами того же
+    потока, и если он застал основной поток внутри записи в stdout, то
+    вложенный print падает с `RuntimeError: reentrant call inside
+    <_io.BufferedWriter>` — CPython защищает буфер от повторного входа.
+    Замер на 8000 доставках, пока основной поток непрерывно печатал: 6485
+    (81%) обращений в обработчике падали именно так. Результат для
+    наблюдателя — штатная остановка по SIGTERM, доложенная как аварийное
+    завершение: WATCH_STOPPED не печатается, а RuntimeError всплывает в
+    основном потоке и уходит в фатальную ветку run().
+
+    os.write в буфер не заходит и блокировку не берёт, поэтому этот путь
+    не зависит от того, чем занят stdout. Исключения гасятся: обработчик
+    печатает ПОСЛЕДНЕЕ событие, и падать ему негде и незачем.
+
+    Цена размена названа прямо: строка уходит в fd 1 раньше того, что уже
+    лежит в буфере, и прерванное событие допечатается интерпретатором
+    ПОСЛЕ WATCH_STOPPED. Порядок нарушается, строки — нет: буфер сливается
+    одним куском, а os.write короткой строки атомарен.
+    """
+    try:
+        os.write(1, (line + "\n").encode("utf-8", "replace"))
+    except Exception:
+        pass
 
 
 def _norm_id_key(raw_id):
@@ -571,7 +624,9 @@ def handle_signal(signum, _frame):
         name = signal.Signals(signum).name
     except (ValueError, AttributeError):
         name = f"SIG{signum}"
-    emit(f"WATCH_STOPPED repo={REPO or '(unknown)'} signal={name}")
+    # _emit_raw, а не emit: вложенный print падает, если сигнал застал
+    # основной поток внутри записи в stdout (см. _emit_raw).
+    _emit_raw(f"WATCH_STOPPED repo={REPO or '(unknown)'} signal={name}")
     sys.exit(0)
 
 
@@ -588,8 +643,13 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)
 
     # Репозиторий определяется здесь, а не на импорте: отказ обязан выйти
-    # событием, а не падением до первой строки stdout.
+    # событием, а не падением до первой строки stdout. Оба источника —
+    # переменная окружения и авто-определение — читаются в ОДНОЙ точке:
+    # раздвоенная политика (переменная на импорте, детект в main) делала
+    # поведение зависимым от момента импорта.
     global REPO
+    if not REPO:
+        REPO = _repo_from_env()
     if not REPO:
         try:
             REPO = _detect_repo()
@@ -597,6 +657,15 @@ def main():
             emit(f"WATCH_ERROR init: {e}")
             emit("WATCH_STOPPED repo=(unknown) signal=NO_REPO")
             return 1
+
+    # Форма проверяется один раз здесь, а не на каждом опросе: кривое имя
+    # иначе даёт бесконечную ленту одинаковых WATCH_ERROR вместо отказа.
+    # В событии печатается `(unknown)`, а не само значение: пробел внутри
+    # разорвал бы строку события на пары key=value у потребителя.
+    if not _repo_is_valid(REPO):
+        emit(f"WATCH_ERROR init: некорректный REPO {REPO!r}, ожидается owner/name")
+        emit("WATCH_STOPPED repo=(unknown) signal=BAD_REPO")
+        return 1
 
     # pr_number -> {"last_comment_key": (datetime, (kind, value)),
     #               "ci": str, "labels": str, "review": str}
@@ -820,12 +889,16 @@ def self_test():
     original_time = globals()["time"]
     original_repo = globals()["REPO"]
     original_main = globals()["main"]
+    original_emit_raw = globals()["_emit_raw"]
+    original_repo_from_env = globals()["_repo_from_env"]
+    original_detect_repo = globals()["_detect_repo"]
 
     def check(name, condition):
         results.append((name, bool(condition)))
 
     try:
         globals()["emit"] = captured.append
+        globals()["_emit_raw"] = captured.append
         _clear_warning_sets()
 
         plain = {"id": 1, "created_at": "2026-08-20T12:34:56Z"}
@@ -1643,6 +1716,128 @@ def self_test():
             raised is None
             and captured[start:] == ["WATCH_STOPPED repo=owner/name signal=SIG9999"],
         )
+
+        # Обработчик печатает событие, даже когда stdout занят. Здесь
+        # работает НАСТОЯЩИЙ guard CPython, а не рукодельный двойник:
+        # запись в буферизованный stdout, внутри которой происходит
+        # вложенная печать, поднимает RuntimeError о повторном входе —
+        # ровно то, что делает сигнал, пришедший внутрь emit(). Двойник
+        # такого класса врал бы (см. fake-signal-mimics-real-interface),
+        # поэтому механизм берётся живой, а событие ловится с fd 1.
+        globals()["_emit_raw"] = original_emit_raw
+        globals()["signal"] = original_signal
+        globals()["REPO"] = "owner/name"
+        probe = {}
+
+        class _BusyStdout(io.RawIOBase):
+            def writable(self):
+                return True
+
+            def write(self, chunk):
+                # Один раз: иначе поздний сброс буфера при сборке мусора
+                # позовёт обработчик второй раз уже после проверки.
+                if probe.get("fired"):
+                    return len(chunk)
+                probe["fired"] = True
+                try:
+                    print("вложенное событие", flush=True)
+                    probe["nested"] = "печать удалась"
+                except Exception as e:
+                    probe["nested"] = type(e).__name__
+                handle_signal(original_signal.SIGTERM, None)
+                return len(chunk)
+
+        saved_fd = os.dup(1)
+        read_fd, write_fd = os.pipe()
+        real_stdout = sys.stdout
+        os.dup2(write_fd, 1)
+        try:
+            sys.stdout = io.TextIOWrapper(io.BufferedWriter(_BusyStdout()))
+            try:
+                print("основное событие", flush=True)
+            except SystemExit:
+                probe["exited"] = True
+            except BaseException as e:
+                probe["exited"] = type(e).__name__
+        finally:
+            sys.stdout = real_stdout
+            os.dup2(saved_fd, 1)
+            os.close(saved_fd)
+            os.close(write_fd)
+        payload = os.read(read_fd, 4096).decode("utf-8", "replace")
+        os.close(read_fd)
+        check(
+            "signal-event-survives-busy-stdout",
+            probe.get("nested") == "RuntimeError"
+            and probe.get("exited") is True
+            and payload == "WATCH_STOPPED repo=owner/name signal=SIGTERM\n",
+        )
+        globals()["_emit_raw"] = captured.append
+
+        # Переменная окружения читается ВНУТРИ main(). Была раздвоенная
+        # политика: переменная на импорте, авто-определение в main. Значение,
+        # выставленное обёрткой после импорта, при этом молча терялось.
+        detect_calls = []
+
+        def _detect_probe():
+            detect_calls.append(1)
+            return "detected/repo"
+
+        globals()["_repo_from_env"] = lambda env=None: "env/repo"
+        globals()["_detect_repo"] = _detect_probe
+        globals()["REPO"] = ""
+        globals()["gh_json"] = lambda _args: []
+        globals()["signal"] = _FakeSignal
+        globals()["time"] = _FakeTime
+        try:
+            main()
+        except _StopLoop:
+            pass
+        except BaseException as e:
+            detect_calls.append(f"main упал: {type(e).__name__}")
+        check(
+            "repo-env-read-inside-main",
+            globals()["REPO"] == "env/repo" and not detect_calls,
+        )
+
+        # Форма имени. Проверка живёт в main(), поэтому оба источника
+        # отдают одно и то же кривое значение — кейс о валидации, а не о
+        # том, какой из источников сработал.
+        check(
+            "repo-format-rejects-broken",
+            not _repo_is_valid("")
+            and not _repo_is_valid("owner")
+            and not _repo_is_valid("owner/")
+            and not _repo_is_valid("/name")
+            and not _repo_is_valid("owner/name/extra")
+            and not _repo_is_valid("owner name/repo"),
+        )
+        # И не строже GitHub: `.github` — существующее имя, а отказ
+        # стартовать на живом репозитории хуже невнятной ошибки gh.
+        check(
+            "repo-format-accepts-live-names",
+            _repo_is_valid("einarluha-a11y/codex-for-code")
+            and _repo_is_valid("owner/.github")
+            and _repo_is_valid("Owner_1/repo.name-2"),
+        )
+        globals()["_repo_from_env"] = lambda env=None: "не репозиторий"
+        globals()["_detect_repo"] = lambda: "не репозиторий"
+        globals()["REPO"] = ""
+        start = len(captured)
+        try:
+            rc = main()
+        except BaseException as e:
+            rc = f"main упал: {type(e).__name__}"
+        lines = captured[start:]
+        check(
+            "repo-format-checked-inside-main",
+            rc == 1
+            and any(line.startswith("WATCH_ERROR init: некорректный REPO")
+                    for line in lines)
+            and "WATCH_STOPPED repo=(unknown) signal=BAD_REPO" in lines,
+        )
+        globals()["_repo_from_env"] = original_repo_from_env
+        globals()["_detect_repo"] = original_detect_repo
         globals()["REPO"] = original_repo
     except Exception as e:
         results.append((f"unexpected: {type(e).__name__}: {e}", False))
@@ -1655,6 +1850,9 @@ def self_test():
         globals()["time"] = original_time
         globals()["REPO"] = original_repo
         globals()["main"] = original_main
+        globals()["_emit_raw"] = original_emit_raw
+        globals()["_repo_from_env"] = original_repo_from_env
+        globals()["_detect_repo"] = original_detect_repo
         _clear_warning_sets()
 
     failed = [name for name, ok in results if not ok]
