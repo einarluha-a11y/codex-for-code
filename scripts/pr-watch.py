@@ -151,6 +151,11 @@ _PR_FIELDS = "number,title,labels,reviewDecision"
 _PR_FIELDS_NO_REVIEW = "number,title,labels"
 _UNKNOWN_FIELD_STDERR = "unknown json field"
 _review_field_supported = True
+# Формат финального события обработчика сигнала вынесен в константу, чтобы
+# кейс длины строки строил её ТЕМ ЖЕ форматом, что и handle_signal, а не
+# независимым литералом: смена формата обязана валить кейс, а не расходиться
+# с ним молча.
+_STOP_EVENT_FMT = "WATCH_STOPPED repo={repo} signal={sig}"
 
 
 class GhError(Exception):
@@ -372,12 +377,17 @@ def _emit_raw(line):
     одним куском, а os.write короткой строки атомарен.
 
     Граница «короткой» строки явная: POSIX гарантирует атомарность записи
-    в канал до PIPE_BUF (4096 байт на Linux и macOS). Единственный
+    в канал до PIPE_BUF. Значение платформенное: 512 байт на macOS (это же
+    минимум, гарантированный POSIX) и 4096 байт на Linux. Расчёт запаса
+    ведётся по МЕНЬШЕМУ значению — скрипт работает на обеих платформах, и
+    безопасно только то, что помещается в тесную границу. Единственный
     продовый вызов даёт фиксированный формат
     `WATCH_STOPPED repo=<owner/name> signal=<NAME>` — с лимитами GitHub
-    на длину owner и name потолок составляет около 180 байт, то есть до
-    границы на порядок. Инвариант «единственный вызов» держится кейсом
-    emit-raw-has-single-production-call-site, а не чтением кода.
+    на длину owner и name потолок составляет около 180 байт, то есть на
+    macOS помещается с запасом примерно втрое. Инвариант «единственный
+    вызов» держится кейсом emit-raw-has-single-production-call-site, а
+    помещаемость строки в 512 байт — кейсом
+    emit-raw-line-fits-smallest-pipe-buf, а не чтением кода.
 
     Дескриптор 1 записан числом намеренно. Ревью предлагало
     sys.__stdout__.fileno(); замер отвергает по трём пунктам. Значение то
@@ -711,8 +721,10 @@ def handle_signal(signum, _frame):
     except (ValueError, AttributeError):
         name = f"SIG{signum}"
     # _emit_raw, а не emit: вложенный print падает, если сигнал застал
-    # основной поток внутри записи в stdout (см. _emit_raw).
-    _emit_raw(f"WATCH_STOPPED repo={REPO or '(unknown)'} signal={name}")
+    # основной поток внутри записи в stdout (см. _emit_raw). Формат берётся
+    # из _STOP_EVENT_FMT — тот же, которым кейс длины проверяет помещаемость
+    # строки в PIPE_BUF.
+    _emit_raw(_STOP_EVENT_FMT.format(repo=REPO or "(unknown)", sig=name))
     sys.exit(0)
 
 
@@ -1930,34 +1942,69 @@ def self_test():
         globals()["_emit_raw"] = captured.append
 
         # Единственный продовый вызов _emit_raw — инвариант, на котором
-        # стоит гарантия атомарности. Кейс доказывает его через AST,
-        # чтобы случайное добавление второго вызова не прошло незамеченным.
+        # стоит гарантия атомарности. Кейс доказывает его через AST по ВСЕМУ
+        # файлу с вычетом тела self_test — прежний срез по "\ndef self_test("
+        # разбирал только префикс, и вызов, добавленный ПОСЛЕ self_test,
+        # ускользал бы от детекта (закреплено откатом C2).
         import ast as _ast
         with open(__file__, encoding="utf-8") as _fh:
             _file_src = _fh.read()
-        _selftest_start = _file_src.index("\ndef self_test(")
-        _prod_src = _file_src[:_selftest_start]
-        _prod_tree = _ast.parse(_prod_src)
+        _file_tree = _ast.parse(_file_src)
+        # Диапазон строк self_test на уровне модуля — его тело из подсчёта
+        # исключается (там подмены и заглушки, не продовые вызовы).
+        _st_start = _st_end = None
+        for _node in _ast.iter_child_nodes(_file_tree):
+            if (isinstance(_node, _ast.FunctionDef)
+                    and _node.name == "self_test"):
+                _st_start, _st_end = _node.lineno, _node.end_lineno
+                break
         _emit_raw_calls = [
             _node
-            for _node in _ast.walk(_prod_tree)
+            for _node in _ast.walk(_file_tree)
             if (isinstance(_node, _ast.Call)
                 and isinstance(_node.func, _ast.Name)
-                and _node.func.id == "_emit_raw")
+                and _node.func.id == "_emit_raw"
+                and not (_st_start is not None
+                         and _st_start <= _node.lineno <= _st_end))
         ]
         _first_arg_ok = False
         if len(_emit_raw_calls) == 1:
             _arg0 = (_emit_raw_calls[0].args[0]
                      if _emit_raw_calls[0].args else None)
-            if isinstance(_arg0, _ast.JoinedStr) and _arg0.values:
-                _first_piece = _arg0.values[0]
-                if (isinstance(_first_piece, _ast.Constant)
-                        and isinstance(_first_piece.value, str)):
-                    _first_arg_ok = _first_piece.value.startswith(
-                        "WATCH_STOPPED"
-                    )
+            if _arg0 is not None:
+                try:
+                    _arg_src = _ast.unparse(_arg0)  # Python 3.9+
+                except AttributeError:
+                    _arg_src = _ast.dump(_arg0)
+                # После вынесения формата в _STOP_EVENT_FMT продовый вызов —
+                # `_STOP_EVENT_FMT.format(...)`; принимаем и прямой литерал
+                # WATCH_STOPPED на случай отката рефактора.
+                #
+                # Проверка идёт по НАЧАЛУ выражения, а не вхождением подстроки.
+                # Вхождение пропускало бы чужое событие, внутри которого имя
+                # формата упомянуто, — например
+                # `_emit_raw(f"PR_COMMENT #1 {_STOP_EVENT_FMT}")`: единственный
+                # вызов, подстрока на месте, а в fd 1 уходит тело комментария,
+                # против чего инвариант и написан. Закреплено откатом 6.
+                _stripped = _arg_src.lstrip("fF").lstrip("\"'")
+                _first_arg_ok = (
+                    _arg_src.startswith("_STOP_EVENT_FMT.format(")
+                    or _stripped.startswith("WATCH_STOPPED")
+                )
         check("emit-raw-has-single-production-call-site",
               len(_emit_raw_calls) == 1 and _first_arg_ok)
+
+        # Худшая по длине строка события обязана помещаться в САМЫЙ тесный
+        # PIPE_BUF (512 байт на macOS, минимум по POSIX) — иначе гарантия
+        # атомарности записи из _emit_raw не держится на macOS. Строка
+        # строится ТЕМ ЖЕ форматом, что и handle_signal (_STOP_EVENT_FMT),
+        # поэтому смена формата валит этот кейс, а не расходится с ним молча.
+        worst = _STOP_EVENT_FMT.format(
+            repo="o" * 39 + "/" + "n" * 100,  # предельные owner/name GitHub
+            sig="SIGTERM",                     # самое длинное имя сигнала
+        )
+        check("emit-raw-line-fits-smallest-pipe-buf",
+              len(worst.encode("utf-8")) < 512)
 
         # Ветки except в run() печатают обычным emit — и это верно. Кейсы
         # держат вывод машинно: исключение поднимается ИЗНУТРИ незавершённой
