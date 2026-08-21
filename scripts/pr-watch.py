@@ -2669,11 +2669,21 @@ def self_test():
         # ещё до самопроверки. Три переменные покрыты по отдельности: дефект
         # был одинаков в трёх местах, и кейс на одно оставил бы два слепыми.
         # original_subprocess — настоящий модуль, независимо от подмен выше.
+        # Ребёнок помечается, и по метке НЕ порождает собственных детей.
+        # Иначе кейс безопасен только пока исправна сама проводка, которую он и
+        # проверяет: сними её — и ребёнок доживает до самопроверки, порождает
+        # трёх своих, те по трое, и так далее. Замерено откатом проводки:
+        # 261 процесс за три секунды, самопроверка падает не красным кейсом, а
+        # TimeoutExpired, обрывая всё, что шло после. Приём не имеет права
+        # опираться на исправность того, что проверяет.
+        _CHILD_MARK = "PR_WATCH_SELFTEST_CHILD"
         _wiring = (
             ("INTERVAL", "0"),
             ("GH_TIMEOUT", "abc"),
             ("GH_TIMEOUT_PAGINATED", "-5"),
         )
+        if os.environ.get(_CHILD_MARK) == "1":
+            _wiring = ()
         for _var, _bad in _wiring:
             _child_env = dict(os.environ)
             # Прочие числовые переменные — чистый default, чтобы отказ был
@@ -2681,6 +2691,7 @@ def self_test():
             for _other, _ in _wiring:
                 _child_env.pop(_other, None)
             _child_env[_var] = _bad
+            _child_env[_CHILD_MARK] = "1"
             _proc = original_subprocess.run(
                 [sys.executable, __file__, "--self-test"],
                 env=_child_env,
