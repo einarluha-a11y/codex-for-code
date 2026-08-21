@@ -24,6 +24,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 
 
@@ -54,10 +55,29 @@ def _detect_repo():
 # WATCH_STARTED, ни WATCH_ERROR, ни WATCH_STOPPED — вызывающий видит просто
 # мёртвый процесс и не знает причины. Теперь определение ленивое, внутри
 # main(), и любой отказ выходит наружу событием.
+def _repo_from_env(env=None):
+    """REPO из окружения, нормализованный до «есть значение / нет значения».
+
+    .strip() не косметика: REPO=" " (пробел из .env, launchd-plist или
+    подстановки пустой переменной в шелле) — НЕ пустая строка, поэтому
+    прежнее `or ""` его пропускало. Ленивое определение репозитория не
+    включалось, и каждый вызов gh уходил с `--repo " "`: watcher жил бы,
+    отвечая WATCH_ERROR на каждый опрос — постоянная слепота вместо
+    громкого отказа на старте. После нормализации такой ввод неотличим от
+    отсутствующего и уходит в авто-определение.
+
+    Отдельной функцией — чтобы это поведение было проверяемым: выражение
+    на уровне модуля вычисляется один раз на импорте и в self-test уже не
+    доступно.
+    """
+    source = os.environ if env is None else env
+    return (source.get("REPO") or "").strip()
+
+
 REPO = (
     "selftest/selftest"
     if "--self-test" in sys.argv
-    else os.environ.get("REPO") or ""
+    else _repo_from_env()
 )
 INTERVAL = int(os.environ.get("INTERVAL", "30"))
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
@@ -534,15 +554,31 @@ def snapshot(prs):
 
 
 def handle_signal(signum, _frame):
-    emit(f"WATCH_STOPPED repo={REPO} signal={signal.Signals(signum).name}")
+    # Обработчик ставится РАНЬШЕ определения репозитория, поэтому пустой
+    # REPO здесь — штатное состояние, а не «не должно случиться». Токен
+    # `repo=` без значения ломал бы разбор строки события по парам
+    # key=value у потребителя; форма совпадает с той, что печатает run().
+    emit(
+        f"WATCH_STOPPED repo={REPO or '(unknown)'} "
+        f"signal={signal.Signals(signum).name}"
+    )
     sys.exit(0)
 
 
 def main():
+    # Обработчики сигналов ставятся ПЕРВЫМИ — раньше любой работы, которая
+    # может занять время. Прошлый порядок (сначала репозиторий) был моей
+    # ошибкой: _detect_repo() запускает `gh repo view` с таймаутом 10 с, и
+    # весь этот отрезок процесс жил без обработчиков — SIGTERM убивал его
+    # молча, ровно тот исход, ради которого определение и переносилось с
+    # импорта внутрь main(). Разменивалось это на косметику: пустой токен
+    # `repo=` в раннем событии. После нормализации в handle_signal размена
+    # больше нет — печатается `repo=(unknown)`, а окно молчания закрыто.
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
     # Репозиторий определяется здесь, а не на импорте: отказ обязан выйти
-    # событием, а не падением до первой строки stdout. Порядок важен —
-    # сначала REPO, потом обработчики сигналов, иначе ранний SIGTERM
-    # напечатал бы WATCH_STOPPED с пустым repo=.
+    # событием, а не падением до первой строки stdout.
     global REPO
     if not REPO:
         try:
@@ -551,9 +587,6 @@ def main():
             emit(f"WATCH_ERROR init: {e}")
             emit("WATCH_STOPPED repo=(unknown) signal=NO_REPO")
             return 1
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
 
     # pr_number -> {"last_comment_key": (datetime, (kind, value)),
     #               "ci": str, "labels": str, "review": str}
@@ -709,6 +742,27 @@ def main():
         time.sleep(INTERVAL)
 
 
+def _crash_site(exc):
+    """Файл и строка самого глубокого кадра — локализация в ОДНУ строку.
+
+    Ревью предлагало печатать полный traceback. Диагноз принят (по одной
+    строке `TypeError: ...` не найти место падения), лечение — другое:
+    контракт наблюдателя «каждая stdout-строка = событие», и многострочный
+    дамп превратился бы в поток мусорных событий у любого потребителя,
+    который читает stdout построчно. Место падения даёт ту же локализацию,
+    не ломая контракт; полный traceback остаётся в stderr, если процесс
+    падает по-настоящему.
+    """
+    try:
+        frames = traceback.extract_tb(exc.__traceback__)
+    except Exception:
+        return ""
+    if not frames:
+        return ""
+    last = frames[-1]
+    return f" at {os.path.basename(last.filename)}:{last.lineno}"
+
+
 def run():
     """Запуск main() с гарантией финального события.
 
@@ -727,8 +781,19 @@ def run():
         return main() or 0
     except SystemExit:
         raise
-    except BaseException as e:
-        emit(f"WATCH_ERROR fatal: {type(e).__name__}: {e}")
+    except KeyboardInterrupt:
+        # Ctrl-C — не крах, а штатное завершение. Прежний перехват
+        # BaseException делал его неотличимым от бага: печатал
+        # `WATCH_ERROR fatal: KeyboardInterrupt` и возвращал 1, то есть
+        # соврал бы и потребителю событий, и коду выхода (130 → 1).
+        # Событие всё равно нужно — окно до регистрации обработчиков
+        # существует, и в нём SIGINT приходит сюда исключением, — но само
+        # исключение пробрасывается, чтобы интерпретатор завершился как
+        # положено. Форма события совпадает с сигнальным путём.
+        emit(f"WATCH_STOPPED repo={REPO or '(unknown)'} signal=SIGINT")
+        raise
+    except Exception as e:
+        emit(f"WATCH_ERROR fatal: {type(e).__name__}: {e}{_crash_site(e)}")
         emit(f"WATCH_STOPPED repo={REPO or '(unknown)'} signal=EXCEPTION")
         return 1
 
@@ -1354,6 +1419,44 @@ def self_test():
                     for line in lines),
         )
 
+        # Обработчики сигналов обязаны стоять РАНЬШЕ определения репозитория:
+        # `gh repo view` держит до 10 с, и SIGTERM в этом окне убивал процесс
+        # молча. Проба снимает список зарегистрированных сигналов В МОМЕНТ
+        # вызова gh — если порядок переставят обратно, он окажется пустым.
+        registered = []
+
+        class _OrderProbeSignal:
+            SIGTERM = 15
+            SIGINT = 2
+
+            @staticmethod
+            def signal(sig, _handler):
+                registered.append(sig)
+
+            @staticmethod
+            def Signals(value):
+                return value
+
+        class _OrderProbeSubprocess:
+            seen_at_call = None
+
+            def run(self, *_args, **_kwargs):
+                _OrderProbeSubprocess.seen_at_call = list(registered)
+                return _Result(1, "", "gh: not authenticated")
+
+        globals()["REPO"] = ""
+        globals()["signal"] = _OrderProbeSignal
+        globals()["subprocess"] = _OrderProbeSubprocess()
+        try:
+            main()
+        except BaseException as e:
+            _OrderProbeSubprocess.seen_at_call = f"main упал: {type(e).__name__}"
+        check(
+            "signal-handlers-registered-before-repo-detection",
+            _OrderProbeSubprocess.seen_at_call == [15, 2],
+        )
+        globals()["signal"] = _FakeSignal
+
         # Определение репозитория обязано ходить через ГЛОБАЛЬНЫЙ subprocess.
         # Вернётся локальный `import subprocess` внутри _detect_repo() — этот
         # кейс поймает: подменённый ответ перестанет доезжать, и функция
@@ -1369,6 +1472,16 @@ def self_test():
         globals()["REPO"] = original_repo
         globals()["subprocess"] = original_subprocess
 
+        # Пустое/пробельное значение переменной окружения обязано быть
+        # неотличимо от отсутствующего, иначе gh зовётся с `--repo " "`.
+        check(
+            "blank-repo-env-is-treated-as-absent",
+            _repo_from_env({}) == ""
+            and _repo_from_env({"REPO": ""}) == ""
+            and _repo_from_env({"REPO": "   "}) == ""
+            and _repo_from_env({"REPO": " owner/name \n"}) == "owner/name",
+        )
+
         # --- Необработанный сбой закрывает поток событием ---
         def _boom():
             raise RuntimeError("bang")
@@ -1380,9 +1493,52 @@ def self_test():
         check(
             "fatal-exception-emits-final-event",
             rc == 1
-            and any(line == "WATCH_ERROR fatal: RuntimeError: bang"
+            and any(line.startswith("WATCH_ERROR fatal: RuntimeError: bang")
                     for line in lines)
             and any(line.endswith("signal=EXCEPTION") for line in lines),
+        )
+
+        # Событие обязано называть МЕСТО падения: по одному имени класса
+        # исключения место не найти, а полный traceback ломал бы контракт
+        # «одна строка = одно событие».
+        # Ожидание выводится из кода самой функции, а не пишется строкой:
+        # зашитое «pr-watch.py» ломало кейс на любой копии файла (ровно это
+        # и вышло на мутационном прогоне из /tmp) — провал был бы про имя
+        # копии, а не про поведение.
+        boom_site = " at {}:{}".format(
+            os.path.basename(_boom.__code__.co_filename),
+            _boom.__code__.co_firstlineno + 1,
+        )
+        check(
+            "fatal-event-names-crash-site",
+            any(line.startswith("WATCH_ERROR fatal:")
+                and line.endswith(boom_site)
+                for line in lines),
+        )
+
+        # Ctrl-C — не крах. Перехват BaseException выдавал его за баг
+        # (`WATCH_ERROR fatal: KeyboardInterrupt`, код возврата 1) и гасил
+        # штатное прерывание.
+        def _interrupt():
+            raise KeyboardInterrupt()
+
+        globals()["main"] = _interrupt
+        start = len(captured)
+        propagated = False
+        try:
+            run()
+        except KeyboardInterrupt:
+            propagated = True
+        except BaseException as e:
+            propagated = f"подменено на {type(e).__name__}"
+        lines = captured[start:]
+        check(
+            "fatal-guard-does-not-mask-keyboardinterrupt",
+            propagated is True
+            and any(line.endswith("signal=SIGINT") for line in lines)
+            and not any("signal=EXCEPTION" in line for line in lines)
+            and not any(line.startswith("WATCH_ERROR fatal:")
+                        for line in lines),
         )
 
         # Штатный выход по сигналу НЕ должен превращаться во второе, ложное
@@ -1404,6 +1560,22 @@ def self_test():
                         for line in captured[start:]),
         )
         globals()["main"] = original_main
+
+        # Сигнальный путь на неопределившемся REPO печатал `repo= signal=…`:
+        # пустой токен ломает разбор строки по парам key=value. Нужен
+        # настоящий signal — подменённый отдаёт из Signals() число без .name.
+        globals()["signal"] = original_signal
+        globals()["REPO"] = ""
+        start = len(captured)
+        try:
+            handle_signal(original_signal.SIGTERM, None)
+        except SystemExit:
+            pass
+        check(
+            "signal-event-normalizes-empty-repo",
+            captured[start:] == ["WATCH_STOPPED repo=(unknown) signal=SIGTERM"],
+        )
+        globals()["REPO"] = original_repo
     except Exception as e:
         results.append((f"unexpected: {type(e).__name__}: {e}", False))
     finally:
