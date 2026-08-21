@@ -4,10 +4,16 @@
 Инвариант (Pitfalls P1/P9): чек НЕ должен показывать успех, когда ревью не
 выполнялось. Ложный зелёный хуже красного — он молча снимает сомнение.
 
-Проверяем ветки шага «Publish codex check-run conclusion»:
-  • нет OPENAI_API_KEY (guardSkip) → conclusion=neutral (НЕ success);
-  • ошибка ревью (else, codexOutcome≠success) → conclusion=failure;
-  • output.title непустой во всех ветках.
+Архитектура: job `preflight` проверяет секрет и (при отсутствии) публикует
+neutral. Job `codex` запускается только при has_key=true — без ключа показывает
+skipped (не success).
+
+Проверяем:
+  • codex job зависит от preflight и проверяет has_key (не зеленеет без ключа);
+  • preflight публикует neutral check-run при отсутствии ключа;
+  • docs-only (trivial) → conclusion=neutral, НЕ success;
+  • ошибка ревью (else) → conclusion=failure;
+  • guardSkip отсутствует в шаге Publish (только в preflight).
 
 Только stdlib, Python 3.9+. Regex по сырому тексту — надёжнее yaml.safe_load
 для встроенного в github-script JS. Exit 0 = PASS, ≠0 = FAIL.
@@ -31,9 +37,30 @@ def main() -> None:
 
     text = TEMPLATE.read_text(encoding="utf-8")
 
-    # Вырезаем тело шага публикации исхода — единственное место, где решается
-    # conclusion. Проверять весь файл нельзя: слово neutral/success/failure
-    # встречается в комментариях, что дало бы ложный проход.
+    # ── (a) job codex зависит от preflight и проверяет has_key ───────────────
+    # Без этого codex может зеленеть без реального ревью (false green, P1/P9).
+    if "needs.preflight.outputs.has_key" not in text:
+        fail(
+            "codex job не проверяет needs.preflight.outputs.has_key — "
+            "job может зеленеть без ключа (false green, Pitfalls P1/P9)"
+        )
+    if not re.search(r"needs:\s*\[?\s*preflight", text):
+        fail(
+            "codex job не имеет 'needs: preflight' — "
+            "зависимость от guard-job не установлена"
+        )
+
+    # ── (a2) preflight публикует neutral при отсутствии ключа ─────────────────
+    # Единственный канал публикации check-run, когда codex job skipped.
+    if "Publish neutral check-run" not in text:
+        fail(
+            "preflight job не имеет шага публикации neutral check-run — "
+            "при отсутствии ключа check-run не будет опубликован"
+        )
+
+    # Вырезаем тело шага публикации исхода в job codex — единственное место,
+    # где решается conclusion для выполнившегося ревью. Проверять весь файл
+    # нельзя: слово neutral/success/failure встречается в комментариях.
     step = re.search(
         r"name:\s*Publish codex check-run conclusion(?P<body>.*?)(?:\Z)",
         text,
@@ -43,25 +70,41 @@ def main() -> None:
         fail("шаг 'Publish codex check-run conclusion' не найден — исход не публикуется через Checks API")
     body = step.group("body")
 
-    # (b) Ветка «нет ключа» (guardSkip) → conclusion='neutral', НЕ 'success'.
-    m = re.search(r"if\s*\(\s*guardSkip\s*\)\s*\{(?P<blk>.*?)\}", body, re.DOTALL)
-    if not m:
-        fail("ветка guardSkip (нет OPENAI_API_KEY) не найдена")
-    nokey = m.group("blk")
-    mc = re.search(r"conclusion\s*=\s*'([a-z]+)'", nokey)
-    if not mc:
-        fail("в ветке guardSkip не присвоен conclusion")
-    if mc.group(1) != "neutral":
-        fail(f"ветка «нет ключа» даёт conclusion='{mc.group(1)}', ожидается 'neutral' "
-             f"(false green — Pitfalls P1/P9)")
-    mt = re.search(r"title\s*=\s*'([^']*)'", nokey)
-    if not mt or not mt.group(1).strip():
-        fail("в ветке guardSkip output.title пустой/отсутствует")
-    if "OPENAI_API_KEY not set in repository secrets" not in mt.group(1):
-        fail(f"в ветке guardSkip title не описывает причину: {mt.group(1)!r}")
+    # ── (b) guardSkip убран из шага Publish — только в preflight ──────────────
+    # Дублирование означало бы, что два места управляют одним исходом.
+    if re.search(r"\bguardSkip\b", body):
+        fail(
+            "guardSkip обнаружен в шаге 'Publish codex check-run conclusion' — "
+            "должен быть только в preflight (дублирование)"
+        )
 
-    # (c) Ветка ошибки ревью (финальный else) → conclusion='failure'.
-    #     Берём последнее присвоение conclusion в теле (ветка else идёт последней).
+    # ── (c) Ветка docs-only (trivial) → conclusion='neutral', НЕ 'success' ───
+    # Правило: «ревью не выполнялось → neutral» едино независимо от причины.
+    m = re.search(r"if\s*\(\s*trivial\s*\)\s*\{(?P<blk>.*?)\}", body, re.DOTALL)
+    if not m:
+        fail("ветка trivial (docs-only) не найдена в шаге публикации")
+    trivialblk = m.group("blk")
+    mc = re.search(r"conclusion\s*=\s*'([a-z]+)'", trivialblk)
+    if not mc:
+        fail("в ветке trivial не присвоен conclusion")
+    if mc.group(1) != "neutral":
+        fail(
+            f"ветка docs-only даёт conclusion='{mc.group(1)}', ожидается 'neutral' "
+            f"(«ревью не выполнялось → neutral», Pitfalls P1/P9)"
+        )
+    mt = re.search(r"title\s*=\s*'([^']*)'", trivialblk)
+    if not mt or not mt.group(1).strip():
+        fail("в ветке trivial output.title пустой/отсутствует")
+    trivial_title = mt.group(1)
+    if "docs-only" not in trivial_title.lower() and "docs" not in trivial_title.lower():
+        fail(f"в ветке trivial title не описывает причину docs-only: {trivial_title!r}")
+    if "OPENAI_API_KEY" in trivial_title:
+        fail(
+            f"в ветке trivial title упоминает OPENAI_API_KEY — "
+            f"нельзя спутать с отсутствием ключа: {trivial_title!r}"
+        )
+
+    # ── (d) Ветка ошибки ревью (финальный else) → conclusion='failure' ────────
     conclusions = re.findall(r"conclusion\s*=\s*'([a-z]+)'", body)
     if "failure" not in conclusions:
         fail(f"ни одна ветка не даёт conclusion='failure'; найдено: {conclusions}")
@@ -75,11 +118,10 @@ def main() -> None:
     err_conc = mc.group(1)
     if err_conc != "failure":
         fail(f"ветка ошибки ревью даёт conclusion='{err_conc}', ожидается 'failure'")
-    # (d) output.title непустой в ветке ошибки (собирается из литерала + переменной).
     if not re.search(r"title\s*=\s*'[^']", errblk):
         fail("в ветке ошибки output.title пустой/отсутствует")
 
-    # (d) Успешная ветка тоже несёт непустой title и conclusion='success'.
+    # ── (e) Успешная ветка → conclusion='success', title непустой ────────────
     m = re.search(r"codexOutcome\s*===\s*'success'\s*\)\s*\{(?P<blk>.*?)\}\s*else", body, re.DOTALL)
     if not m:
         fail("ветка успешного ревью (codexOutcome==='success') не найдена")
@@ -89,13 +131,16 @@ def main() -> None:
     if not re.search(r"title\s*=\s*'[^']", okblk):
         fail("в успешной ветке output.title пустой/отсутствует")
 
-    # Проверяем, что каждая ветка (кроме trivial) присваивает conclusion,
-    # и что neutral появляется ровно в guardSkip.
+    # ── (f) neutral ровно в одной ветке шага Publish (trivial) ───────────────
     if conclusions.count("neutral") != 1:
-        fail(f"conclusion='neutral' должен быть ровно в одной ветке (guardSkip); найдено {conclusions.count('neutral')}")
+        fail(
+            f"conclusion='neutral' должен быть ровно в одной ветке шага Publish (trivial/docs-only); "
+            f"найдено {conclusions.count('neutral')}"
+        )
 
     print("PASS: шаблон codex-review.yml — исход чека честен:")
-    print("  • нет ключа  → conclusion=neutral, title непустой")
+    print("  • нет ключа  → preflight публикует neutral, codex job skipped")
+    print("  • docs-only  → conclusion=neutral, title называет docs-only")
     print("  • ошибка     → conclusion=failure, title непустой")
     print("  • успех      → conclusion=success, title непустой")
     sys.exit(0)

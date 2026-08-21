@@ -6,18 +6,19 @@ name: Codex Review
 # затем раскатывай в потребителей (не наоборот).
 #
 # Закалённые фичи (все — детерминированный контроль ВНУТРИ самого CI):
-#   • guard-шаг + честный исход: без секрета OPENAI_API_KEY ревью НЕ выполняется,
-#     и это публикуется как check-run `codex-review-result` с conclusion=NEUTRAL
-#     (НЕ success — зелёный без реальной проверки был бы false green, Pitfalls
-#     P1/P9). Neutral не блокирует merge и не красит job красным, но и не врёт,
-#     что ревью прошло. Реальная ошибка ревью (сеть/лимит/модель) → conclusion=
-#     failure. Успешное/trivial-ревью → success. См. шаг «Publish codex check-run
-#     conclusion» ниже (job-статус YAML не умеет neutral — только Checks REST API).
+#   • preflight-job: без секрета OPENAI_API_KEY job `codex` НЕ запускается
+#     (пропускается по `if:`, GitHub показывает skipped). Preflight публикует
+#     check-run `codex-review-result` с conclusion=NEUTRAL — не success (Pitfalls
+#     P1/P9: false green хуже red — молча снимает сомнение).
+#   • trivial-check: docs-only PR → Codex не зовём (экономия); check-run =
+#     neutral (ревью не выполнялось — то же правило, что и при отсутствии ключа).
+#   • branch-protection: job, пропущенный по `if:`, GitHub засчитывает
+#     required-чеку как пройденный — потребители с `codex` в обязательных чеках
+#     не блокируются.
 #   • SHA-pin: все actions запинены по коммит-SHA (supply-chain gate — тег @vN
 #     подменяем, SHA нет).
 #   • concurrency: новый push в PR отменяет предыдущее ревью того же PR (иначе
 #     платим за N ревью одного кода, когда чиним находки подряд).
-#   • trivial-check: docs-only PR → Codex не зовём (экономия), но job = success.
 #   • модель-фикс: gpt-5-mini / effort=medium — дефолт парка (~$0.08/review).
 #
 # 🔴 НЕ использовать workflow-level `paths-ignore`.
@@ -26,8 +27,8 @@ name: Codex Review
 #   required-контекст `codex` НИКОГДА не рапортует → GitHub держит его вечно
 #   pending → PR ЗАБЛОКИРОВАН навсегда (наступали на это в парке).
 #   Экономия на docs-PR делается ВНУТРИ workflow через trivial-check:
-#   trivial=true → шаг Codex скипается, а сам job = success для required →
-#   docs-PR разблокирован, при этом дорогой Codex-API реально НЕ вызывается.
+#   trivial=true → шаг Codex скипается, check-run = neutral → docs-PR
+#   разблокирован, при этом дорогой Codex-API реально НЕ вызывается.
 #
 # Триггеры:
 #   opened/synchronize/reopened — авто-ревью на каждый push в PR.
@@ -49,7 +50,9 @@ permissions:
   checks: write
 
 jobs:
-  codex:
+  preflight:
+    # Те же ограничения на форки/боты/черновики, что были на codex.
+    # codex зависит от preflight через needs: пропущенный preflight → пропущенный codex.
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.type != 'Bot' &&
@@ -58,6 +61,56 @@ jobs:
         contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) ||
         (github.event.action == 'labeled' && github.event.label.name == 'codex-review')
       )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: write
+    outputs:
+      has_key: ${{ steps.guard.outputs.has_key }}
+
+    steps:
+      - name: "guard: есть ли OPENAI_API_KEY"
+        id: guard
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$OPENAI_API_KEY" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENAI_API_KEY не задан — Codex review пропущен"
+          fi
+
+      # Публикуем neutral ЗДЕСЬ, потому что job `codex` не стартует без ключа
+      # (needs.preflight.outputs.has_key == 'true' не выполнится → codex skipped).
+      # Примечание о branch protection: job, пропущенный по `if:`, GitHub
+      # засчитывает required-чеку как пройденный — потребители с `codex` в
+      # обязательных чеках не блокируются.
+      - name: Publish neutral check-run (нет ключа)
+        if: steps.guard.outputs.has_key == 'false'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'codex-review-result',
+              head_sha: context.payload.pull_request.head.sha,
+              status: 'completed',
+              conclusion: 'neutral',
+              output: {
+                title: 'Codex review not performed: OPENAI_API_KEY not set in repository secrets',
+                summary: 'OPENAI_API_KEY отсутствует в секретах репозитория — семантическое ревью не запускалось. Исход neutral (не success), чтобы не имитировать зелёный без реальной проверки.',
+              },
+            });
+
+  codex:
+    needs: [preflight]
+    # Запускается только при наличии ключа; без ключа preflight публикует neutral.
+    # Ограничения на форки/боты/черновики заданы в preflight — codex наследует их
+    # через needs (пропущенный preflight → пропущенный codex).
+    # Job, пропущенный по `if:`, GitHub засчитывает required-чеку как пройденный.
+    if: needs.preflight.outputs.has_key == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -95,20 +148,8 @@ jobs:
             echo "trivial=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: "guard: есть ли OPENAI_API_KEY"
-        id: guard
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::OPENAI_API_KEY не задан — Codex review пропущен"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Codex review
-        if: steps.check.outputs.trivial != 'true' && steps.guard.outputs.skip != 'true'
+        if: steps.check.outputs.trivial != 'true'
         id: codex
         uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
         with:
@@ -163,7 +204,7 @@ jobs:
             - NEEDS_HUMAN: policy-нарушения, секреты/RLS, архитектурные вопросы
 
       - name: Post review
-        if: steps.check.outputs.trivial != 'true' && steps.guard.outputs.skip != 'true' && steps.codex.outputs.final-message != ''
+        if: steps.check.outputs.trivial != 'true' && steps.codex.outputs.final-message != ''
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CODEX_MESSAGE: ${{ steps.codex.outputs.final-message }}
@@ -184,13 +225,12 @@ jobs:
 
       # ─────────────────────────────────────────────────────────────────────
       # Публикуем check-run с ЧЕСТНЫМ исходом. Job-статус на уровне YAML не
-      # умеет conclusion=neutral, а «зелёный job без ключа» = ложный успех
-      # (Pitfalls P1/P9: false green хуже red — молча снимает сомнение).
-      # Поэтому исход различаем детерминированно через Checks REST API:
-      #   • нет OPENAI_API_KEY → conclusion=neutral (ревью НЕ выполнялось);
-      #   • ревью реально упало (сеть/лимит/модель) → conclusion=failure;
-      #   • ревью прошло / trivial docs-only → conclusion=success.
-      # output.title во ВСЕХ ветках непустой — иначе исход нечитаем.
+      # умеет conclusion=neutral. К этому шагу codex job ВСЕГДА запущен
+      # (наличие ключа гарантировал preflight). Три ветки:
+      #   • docs-only (trivial) → neutral (ревью не выполнялось, код не менялся);
+      #   • ревью прошло (codexOutcome === 'success') → success;
+      #   • ревью упало (сеть/лимит/модель/отмена) → failure.
+      # Ветка «нет ключа» ОТСУТСТВУЕТ — обрабатывается в job `preflight`.
       # always(): исход публикуется даже когда шаг Codex упал/отменён.
       # ─────────────────────────────────────────────────────────────────────
       - name: Publish codex check-run conclusion
@@ -198,25 +238,20 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           TRIVIAL: ${{ steps.check.outputs.trivial }}
-          GUARD_SKIP: ${{ steps.guard.outputs.skip }}
           CODEX_OUTCOME: ${{ steps.codex.outcome }}
         with:
           script: |
             const trivial = process.env.TRIVIAL === 'true';
-            const guardSkip = process.env.GUARD_SKIP === 'true';
             const codexOutcome = process.env.CODEX_OUTCOME; // success|failure|cancelled|skipped|''
 
             let conclusion, title, summary;
-            if (guardSkip) {
-              // Ключа нет — ревью НЕ выполнялось. НЕ success (это был бы false green).
+            if (trivial) {
+              // docs-only: Codex не зовём — ревью не выполнялось.
+              // neutral, а не success: правило «не выполнялось → neutral» едино
+              // независимо от причины (нет ключа или docs-only — один исход).
               conclusion = 'neutral';
-              title = 'Codex review not performed: OPENAI_API_KEY not set in repository secrets';
-              summary = 'OPENAI_API_KEY отсутствует в секретах репозитория — семантическое ревью не запускалось. Исход neutral (не success), чтобы не имитировать зелёный без реальной проверки.';
-            } else if (trivial) {
-              // docs-only: Codex намеренно не звали, но проверять нечего.
-              conclusion = 'success';
-              title = 'Codex review skipped: docs-only PR (trivial)';
-              summary = 'PR затрагивает только документацию — Codex не вызывался осознанно (экономия), код на ревью отсутствует.';
+              title = 'Codex review not performed: docs-only PR (no code changes)';
+              summary = 'PR затрагивает только документацию — Codex не вызывался осознанно (экономия). Исход neutral, так как ревью не выполнялось.';
             } else if (codexOutcome === 'success') {
               conclusion = 'success';
               title = 'Codex review completed';
