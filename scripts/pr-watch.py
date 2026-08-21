@@ -14,6 +14,9 @@
                                            human-approved / human-rejected
                                            approve-петли, см. docs/ai-workflow.md §6.1)
   WATCH_STOPPED repo=<repo> signal=<signal>
+                                         — сигнал, NO_REPO (репозиторий не
+                                           определился) или EXCEPTION
+                                           (необработанный сбой)
 """
 import json
 import os
@@ -25,8 +28,13 @@ from datetime import datetime, timezone
 
 
 def _detect_repo():
-    """Auto-detect <owner>/<repo> from current git remote via gh CLI."""
-    import subprocess
+    """Auto-detect <owner>/<repo> from current git remote via gh CLI.
+
+    Модуль уже импортировал subprocess сверху; локальный импорт здесь был
+    лишним и вдобавок делал функцию непроверяемой — self-test подменяет
+    ГЛОБАЛЬНЫЙ subprocess, а локальный импорт возвращал настоящий модуль и
+    полез бы в сеть.
+    """
     try:
         out = subprocess.run(
             ['gh', 'repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
@@ -39,10 +47,17 @@ def _detect_repo():
     raise RuntimeError("Cannot detect repo: set REPO env var or run inside a gh-authorized git repo.")
 
 
+# Определение репозитория НЕ делается на импорте. Раньше здесь стоял вызов
+# _detect_repo(), и в неподготовленной среде (нет REPO, gh не авторизован)
+# процесс падал ДО main() — то есть до первой stdout-строки. Для наблюдателя,
+# у которого контракт «каждая строка = событие», это худший исход: ни
+# WATCH_STARTED, ни WATCH_ERROR, ни WATCH_STOPPED — вызывающий видит просто
+# мёртвый процесс и не знает причины. Теперь определение ленивое, внутри
+# main(), и любой отказ выходит наружу событием.
 REPO = (
     "selftest/selftest"
     if "--self-test" in sys.argv
-    else os.environ.get("REPO") or _detect_repo()
+    else os.environ.get("REPO") or ""
 )
 INTERVAL = int(os.environ.get("INTERVAL", "30"))
 _EPOCH = datetime.fromtimestamp(0, tz=timezone.utc)
@@ -524,6 +539,19 @@ def handle_signal(signum, _frame):
 
 
 def main():
+    # Репозиторий определяется здесь, а не на импорте: отказ обязан выйти
+    # событием, а не падением до первой строки stdout. Порядок важен —
+    # сначала REPO, потом обработчики сигналов, иначе ранний SIGTERM
+    # напечатал бы WATCH_STOPPED с пустым repo=.
+    global REPO
+    if not REPO:
+        try:
+            REPO = _detect_repo()
+        except Exception as e:
+            emit(f"WATCH_ERROR init: {e}")
+            emit("WATCH_STOPPED repo=(unknown) signal=NO_REPO")
+            return 1
+
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
@@ -681,6 +709,30 @@ def main():
         time.sleep(INTERVAL)
 
 
+def run():
+    """Запуск main() с гарантией финального события.
+
+    Контракт наблюдателя — «каждая stdout-строка = событие». Любое
+    необработанное исключение внутри main() (не GhError, а любой сбой:
+    смена формата ответа, MemoryError, баг правки) обрывало процесс молча:
+    вызывающий видел прекратившийся поток и не мог отличить «упал» от
+    «событий пока нет». Теперь такой сбой печатает причину и закрывает
+    поток тем же WATCH_STOPPED, что и штатный сигнал.
+
+    SystemExit пробрасывается как есть: его поднимает handle_signal, уже
+    напечатавший своё WATCH_STOPPED, и перехват дал бы второе, ложное
+    событие с signal=EXCEPTION.
+    """
+    try:
+        return main() or 0
+    except SystemExit:
+        raise
+    except BaseException as e:
+        emit(f"WATCH_ERROR fatal: {type(e).__name__}: {e}")
+        emit(f"WATCH_STOPPED repo={REPO or '(unknown)'} signal=EXCEPTION")
+        return 1
+
+
 def self_test():
     """Детерминированная проверка ключей и объединения лент без сети/gh."""
     results = []
@@ -691,6 +743,8 @@ def self_test():
     original_review_field = globals()["_review_field_supported"]
     original_signal = globals()["signal"]
     original_time = globals()["time"]
+    original_repo = globals()["REPO"]
+    original_main = globals()["main"]
 
     def check(name, condition):
         results.append((name, bool(condition)))
@@ -1274,6 +1328,82 @@ def self_test():
         lines = one_iteration([{"number": 2, "title": "второй", "labels": []}])
         check("full-snapshot-still-closes",
               any(line == "PR_CLOSED #1" for line in lines))
+
+        # --- Старт без репозитория: событие, а не молчаливая смерть ---
+        # Раньше _detect_repo() звался на импорте и неподготовленная среда
+        # убивала процесс ДО первой stdout-строки.
+        globals()["REPO"] = ""
+        globals()["subprocess"] = _FakeSubprocess(
+            _Result(1, "", "gh: not authenticated")
+        )
+        start = len(captured)
+        # main() обязан вернуться СРАЗУ. Если ленивое определение уберут,
+        # он уйдёт в петлю и умрёт на подменённом sleep — ловим здесь,
+        # чтобы это было именованным провалом, а не обрывом остальных
+        # кейсов через общий except.
+        try:
+            rc = main()
+        except BaseException as e:
+            rc = f"не вернулся: {type(e).__name__}"
+        lines = captured[start:]
+        check(
+            "no-repo-emits-events-not-crash",
+            rc == 1
+            and any(line.startswith("WATCH_ERROR init:") for line in lines)
+            and any(line == "WATCH_STOPPED repo=(unknown) signal=NO_REPO"
+                    for line in lines),
+        )
+
+        # Определение репозитория обязано ходить через ГЛОБАЛЬНЫЙ subprocess.
+        # Вернётся локальный `import subprocess` внутри _detect_repo() — этот
+        # кейс поймает: подменённый ответ перестанет доезжать, и функция
+        # уйдёт в настоящую сеть.
+        globals()["subprocess"] = _FakeSubprocess(
+            _Result(0, "fake/repo\n", "")
+        )
+        try:
+            detected = _detect_repo()
+        except BaseException as e:
+            detected = f"ошибка: {type(e).__name__}"
+        check("detect-repo-uses-patched-subprocess", detected == "fake/repo")
+        globals()["REPO"] = original_repo
+        globals()["subprocess"] = original_subprocess
+
+        # --- Необработанный сбой закрывает поток событием ---
+        def _boom():
+            raise RuntimeError("bang")
+
+        globals()["main"] = _boom
+        start = len(captured)
+        rc = run()
+        lines = captured[start:]
+        check(
+            "fatal-exception-emits-final-event",
+            rc == 1
+            and any(line == "WATCH_ERROR fatal: RuntimeError: bang"
+                    for line in lines)
+            and any(line.endswith("signal=EXCEPTION") for line in lines),
+        )
+
+        # Штатный выход по сигналу НЕ должен превращаться во второе, ложное
+        # WATCH_STOPPED: handle_signal своё уже напечатал.
+        def _exiter():
+            sys.exit(0)
+
+        globals()["main"] = _exiter
+        start = len(captured)
+        passed_through = False
+        try:
+            run()
+        except SystemExit:
+            passed_through = True
+        check(
+            "fatal-guard-passes-systemexit",
+            passed_through
+            and not any("signal=EXCEPTION" in line
+                        for line in captured[start:]),
+        )
+        globals()["main"] = original_main
     except Exception as e:
         results.append((f"unexpected: {type(e).__name__}: {e}", False))
     finally:
@@ -1283,6 +1413,8 @@ def self_test():
         globals()["_review_field_supported"] = original_review_field
         globals()["signal"] = original_signal
         globals()["time"] = original_time
+        globals()["REPO"] = original_repo
+        globals()["main"] = original_main
         _clear_warning_sets()
 
     failed = [name for name, ok in results if not ok]
@@ -1299,4 +1431,4 @@ def self_test():
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         sys.exit(self_test())
-    main()
+    sys.exit(run())
