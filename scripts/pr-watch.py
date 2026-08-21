@@ -51,6 +51,8 @@ def _repo_from_remote_url(url):
       https://github.com/owner/repo.git  (http://, с логином)
       git://github.com/owner/repo.git
 
+    Регистр хоста и порт игнорируются: GitHub.com, github.com:443 и
+    ssh://git@GitHub.com:22/owner/repo.git считаются одним и тем же хостом.
     Хост, отличный от github.com (GitHub Enterprise, GitLab и т.п.),
     → пустая строка. Мусорный ввод → пустая строка, без исключений.
     """
@@ -64,11 +66,13 @@ def _repo_from_remote_url(url):
     if m:
         host, path = m.group(1), m.group(2)
     else:
-        # URL-like: scheme://[user@]host/path
+        # URL-like: scheme://[user@]host[:port]/path
         m = re.match(r'^(?:https?|git|ssh)://(?:[^@/]+@)?([^/]+)/(.+)$', url)
         if not m:
             return ""
         host, path = m.group(1), m.group(2)
+    # Обе ветки разбора сходятся здесь: регистр и порт отбрасываются один раз.
+    host = host.lower().split(":")[0]
     if host != "github.com":
         return ""
     path = path.rstrip("/")
@@ -1790,6 +1794,19 @@ def self_test():
             and _repo_from_remote_url("https://github.example.com/o/r.git") == ""
             and _repo_from_remote_url("") == ""
             and _repo_from_remote_url("ерунда") == "",
+        )
+
+        # Хост сравнивается без учёта регистра и порта: GitHub.com и
+        # github.com:443 эквивалентны; github.com.evil.example — нет.
+        check(
+            "detect-repo-normalizes-host",
+            _repo_from_remote_url("https://GitHub.com/owner/repo.git") == "owner/repo"
+            and _repo_from_remote_url("https://github.com:443/owner/repo") == "owner/repo"
+            and _repo_from_remote_url("ssh://git@GitHub.com:22/owner/repo.git") == "owner/repo"
+            and _repo_from_remote_url("git@GitHub.com:owner/repo.git") == "owner/repo"
+            and _repo_from_remote_url("git@github.com:owner/repo.git") == "owner/repo"
+            and _repo_from_remote_url("https://gitlab.com/owner/repo.git") == ""
+            and _repo_from_remote_url("https://github.com.evil.example/owner/repo") == "",
         )
 
         # git remote недоступен — функция обязана откатиться на gh.
