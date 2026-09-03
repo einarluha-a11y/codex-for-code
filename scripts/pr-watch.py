@@ -9,10 +9,11 @@
   PR_CI #N | <name1=STATE,name2=STATE,...>
   PR_REVIEW #N | <APPROVED|CHANGES_REQUESTED|REVIEW_REQUIRED|(none)>
                                          — изменилось решение ревью
-  PR_LABELS #N | <label1,label2,...>     — изменился набор меток
-                                           (используется для needs-human /
-                                           human-approved / human-rejected
-                                           approve-петли, см. docs/ai-workflow.md §6.1)
+  PR_LABELS #N | ["label1","label2"]     — изменился набор меток
+                                           (JSON: имя метки может
+                                           содержать запятую; диффер
+                                           общий, имена ему безразличны.
+                                           Пустой набор — [], не «(none)»)
   WATCH_STOPPED repo=<repo> signal=<signal>
                                          — сигнал, NO_REPO (репозиторий не
                                            определился) или EXCEPTION
@@ -471,9 +472,20 @@ def _validated_prs(prs):
 
 
 def labels_str(pr_obj):
-    """Стабильное строковое представление набора меток для diff."""
+    """Стабильное строковое представление набора меток для diff.
+
+    Codex R2 (PR #40): разделителем была запятая, а имя метки на GitHub
+    запятую содержать может. Набор {"a,b"} и набор {"a","b"} давали одну
+    строку, поэтому смена одного на другой НЕ порождала PR_LABELS —
+    тихая потеря события, неотличимая от «меток не меняли». JSON
+    однозначен для любых имён.
+
+    Пустые имена намеренно НЕ отфильтрованы: молчаливый выброс данных
+    из ответа API прячет его поломку, а на однозначность не влияет —
+    в JSON пустая строка отличима от отсутствия элемента.
+    """
     names = sorted(l.get("name", "") for l in (pr_obj.get("labels") or []))
-    return ",".join(names)
+    return json.dumps(names, ensure_ascii=False)
 
 
 def emit(line):
@@ -1012,10 +1024,16 @@ def main():
                          f"пропущен на этой итерации")
                 continue
 
-            # Labels diff (для needs-human / human-approved / human-rejected).
+            # Labels diff. Имена меток здесь не значат ничего: watcher
+            # сообщает о любом изменении набора, решение принимает читатель.
             cur_labels = labels_str(pr_obj)
             if cur_labels != state["labels"]:
-                emit(f"PR_LABELS #{n} | {cur_labels or '(none)'}")
+                # Запасного «(none)» здесь нет намеренно: labels_str всегда
+                # возвращает JSON, и на пустом наборе это "[]" — непустая
+                # строка. Ветка была бы недостижимой, а недостижимая ветка
+                # обещает читателю случай, которого не бывает (оракул
+                # labels-str-never-falsy держит это обещание).
+                emit(f"PR_LABELS #{n} | {cur_labels}")
                 state["labels"] = cur_labels
 
             # Решение ревью (approve / request changes) — из уже полученного
@@ -1169,6 +1187,39 @@ def self_test():
         globals()["emit"] = captured.append
         globals()["_emit_raw"] = captured.append
         _clear_warning_sets()
+
+        # Codex R2 (PR #40): имя метки может содержать запятую, и на
+        # запятой-разделителе два РАЗНЫХ набора давали одну строку —
+        # смена набора не порождала PR_LABELS. Кейс красный на прежней
+        # реализации (проверено откатом на ",".join).
+        _one_comma_label = {"labels": [{"name": "a,b"}]}
+        _two_plain_labels = {"labels": [{"name": "a"}, {"name": "b"}]}
+        check(
+            "labels-str-distinguishes-comma-in-name",
+            labels_str(_one_comma_label) != labels_str(_two_plain_labels),
+        )
+        # Порядок прихода меток на представление не влияет — иначе diff
+        # срабатывал бы на перестановке, которой пользователь не делал.
+        check(
+            "labels-str-order-independent",
+            labels_str({"labels": [{"name": "b"}, {"name": "a"}]})
+            == labels_str(_two_plain_labels),
+        )
+        # Отсутствие меток и пустой список — одно и то же состояние.
+        check(
+            "labels-str-empty-is-stable",
+            labels_str({}) == labels_str({"labels": []}) == "[]",
+        )
+        # Codex R3 (PR #40): строка события собирается без запасного
+        # «(none)». Оракул фиксирует основание — представление непусто
+        # при любом входе, включая отсутствие меток.
+        check(
+            "labels-str-never-falsy",
+            all(bool(labels_str(o)) for o in (
+                {}, {"labels": []}, {"labels": None},
+                {"labels": [{"name": ""}]}, _two_plain_labels,
+            )),
+        )
 
         plain = {"id": 1, "created_at": "2026-08-20T12:34:56Z"}
         fractional = {"id": 2, "created_at": "2026-08-20T12:34:56.123Z"}
