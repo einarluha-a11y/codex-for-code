@@ -1,0 +1,40 @@
+# «Лекарь»: барьер, который PR не может переписать
+# Задание берётся из БАЗОВОЙ ветки (pull_request_target), поэтому правка этого
+# файла внутри PR не меняет то, что исполняется. Код PR не выкачивается и не
+# запускается: нужен только дифф между двумя хешами, которые проставил GitHub.
+name: lekar-guard
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lekar-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    # Имя job — это и есть имя обязательной проверки в защите ветки.
+    name: lekar-guard
+    runs-on: ubuntu-latest
+    steps:
+      # Выкачивается БАЗОВАЯ ветка — её версия скрипта и есть барьер.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+
+      # Ни одно значение из PR не подставляется внутрь run: всё через env,
+      # оболочка читает их как переменные, а не как код.
+      - name: инвариант B
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_AUTHOR_ID: ${{ github.event.pull_request.user.id }}
+          PR_AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+          GIT_NO_REPLACE_OBJECTS: "1"
+        run: python3 bin/einar-lekar-guard.py
