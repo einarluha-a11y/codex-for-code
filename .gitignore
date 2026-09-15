@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
-.einar/
+# context-sources.json — настройка контекст-движка einar-stack, живёт в git (исключение из игнора .einar).
+.einar/*
+!.einar/context-sources.json
