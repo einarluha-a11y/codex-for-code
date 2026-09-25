@@ -19,7 +19,7 @@ name: Codex Review
 #     подменяем, SHA нет).
 #   • concurrency: новый push в PR отменяет предыдущее ревью того же PR (иначе
 #     платим за N ревью одного кода, когда чиним находки подряд).
-#   • модель-фикс: gpt-5-mini / effort=medium — дефолт парка (~$0.08/review).
+#   • модель-фикс: gpt-6-luna / effort=medium — дефолт парка (~$0.08/review).
 #
 # 🔴 НЕ использовать workflow-level `paths-ignore`.
 #   Если `codex` — REQUIRED status check в branch protection, то при
@@ -154,9 +154,9 @@ jobs:
         uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          # Дефолт парка: gpt-5-mini ($0.25/$2 за 1M tok) вместо gpt-5-codex
+          # Дефолт парка: gpt-6-luna ($0.10/$0.50 за 1M tok, с 2026-09-25) вместо gpt-5-codex
           # ($1.25/$10) — 5× дешевле, для review качество достаточно (~$0.08/PR).
-          model: gpt-5-mini
+          model: gpt-6-luna
           effort: medium
           prompt: |
             Ты — СТАРШИЙ инженер-ревьюер. Твоя уникальная ценность — СЕМАНТИЧЕСКИЙ слой,
@@ -219,7 +219,7 @@ jobs:
                 '',
                 process.env.CODEX_MESSAGE,
                 '',
-                '<sub>Автоматическое ревью от OpenAI Codex (gpt-5-mini, effort=medium). Если не согласен — обоснуй в треде и поставь метку `needs-human`.</sub>'
+                '<sub>Автоматическое ревью от OpenAI Codex (gpt-6-luna, effort=medium). Если не согласен — обоснуй в треде и поставь метку `needs-human`.</sub>'
               ].join('\n')
             });
 
