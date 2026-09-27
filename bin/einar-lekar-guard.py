@@ -88,18 +88,79 @@ def подготовить(base, head, cwd=None):
             raise RuntimeError(f"хеш {sha} разрешился в другой объект {видимый}")
 
 
+def пути_диффа(base, head, cwd=None):
+    """Изменённые пути ДОСЛОВНО, как они лежат в дереве.
+
+    Без `-z` git печатает путь с не-ASCII или служебными символами в кавычках и
+    восьмеричных escape (`".github/workflows/\\320\\277.yml"`), и такая строка не
+    совпадает ни с одним судейским шаблоном — правка судьи проходила бы как чужая.
+    `-z` отдаёт пути сырыми байтами через NUL; `--no-renames` называет при
+    переименовании ОБА пути, иначе вывод судейского файла из-под шаблона
+    («переименовал workflow в docs/») виден только по новому имени.
+    Байты читаются без перевода строк: `\\r` в имени файла остаётся `\\r`."""
+    r = subprocess.run(["git", "-c", "core.quotePath=false", "diff", "--name-only",
+                        "-z", "--no-renames", f"{base}...{head}"],
+                       cwd=cwd, capture_output=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"git diff --name-only -z → код {r.returncode}: "
+                           f"{r.stderr.decode('utf-8', 'replace').strip()[:300]}")
+    return [p.decode("utf-8", "surrogateescape")
+            for p in r.stdout.split(b"\0") if p]
+
+
+def строки_патча(патч):
+    """Добавленные строки патча `--unified=0` (байты). Строка засчитывается только
+    ВНУТРИ ханка: заголовок `+++ b/…` не попадает, а строка кода «++x» (в патче
+    `+++x`) больше не теряется. Делится только по `\\n`: splitlines() рвал бы строку
+    по U+2028 или `\\x0c`, и хвост с подавлением выпадал бы из проверки."""
+    добавленные, в_ханке = [], False
+    for сырая in патч.split(b"\n"):
+        if сырая.startswith(b"diff --git "):
+            в_ханке = False
+        elif сырая.startswith(b"@@"):
+            в_ханке = True
+        elif в_ханке and сырая.startswith(b"+"):
+            добавленные.append(сырая[1:].decode("utf-8", "replace"))
+        elif в_ханке and сырая[:1] not in (b"-", b" ", b"\\", b""):
+            в_ханке = False
+    return добавленные
+
+
+def патч(base, head, пути=None, cwd=None):
+    """Сырой патч `--unified=0`; с `пути` — только по этим путям, взятым ДОСЛОВНО
+    (`--literal-pathspecs`: `*` и `:(…)` в имени файла — не шаблоны)."""
+    args = ["git", "--literal-pathspecs", "-c", "core.quotePath=false", "diff",
+            "--unified=0", "--no-renames", "--no-color", "--no-ext-diff",
+            "--no-textconv", f"{base}...{head}"]
+    if пути is not None:
+        args += ["--", *пути]
+    r = subprocess.run(args, cwd=cwd, capture_output=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"git diff --unified=0 → код {r.returncode}: "
+                           f"{r.stderr.decode('utf-8', 'replace').strip()[:300]}")
+    return r.stdout
+
+
 def дифф(base, head, cwd=None):
-    """(список файлов, добавленные строки). Пустой дифф при коммитах — отказ."""
-    файлы = [f for f in git("diff", "--name-only", f"{base}...{head}",
-                            cwd=cwd).splitlines() if f.strip()]
+    """(файлы, добавленные строки, пары (путь, строка)). Пустой дифф при коммитах — отказ.
+
+    Путь каждой строки берётся не из заголовка `+++ b/…` (его git экранирует для
+    не-ASCII имён), а отдельным патчем по каждому пути из `пути_диффа`. Сумма строк
+    по путям обязана совпасть с общим диффом — иначе привязка неполна, и это отказ:
+    без пути проверка не-ASCII в коде молча не работала бы."""
+    файлы = пути_диффа(base, head, cwd=cwd)
     коммитов = git("rev-list", "--count", f"{base}..{head}", cwd=cwd).strip()
     if коммитов != "0" and not файлы:
         raise RuntimeError(f"коммитов {коммитов}, а файлов в диффе ноль — дифф неполон")
-    добавленные = []
-    for строка in git("diff", "--unified=0", f"{base}...{head}", cwd=cwd).splitlines():
-        if строка.startswith("+") and not строка.startswith("+++"):
-            добавленные.append(строка[1:])
-    return файлы, добавленные
+    добавленные = строки_патча(патч(base, head, cwd=cwd))
+    файлы_добавленных = []
+    for путь in файлы:
+        файлы_добавленных += [(путь, с) for с in
+                              строки_патча(патч(base, head, [путь], cwd=cwd))]
+    if len(файлы_добавленных) != len(добавленные):
+        raise RuntimeError(f"строк по путям {len(файлы_добавленных)}, в общем диффе "
+                           f"{len(добавленные)} — привязка строк к файлам неполна")
+    return файлы, добавленные, файлы_добавленных
 
 
 def подавление(строка):
@@ -189,7 +250,7 @@ def main():
         автор = os.environ.get("PR_AUTHOR_LOGIN") or "?"
         ids, _ = принципалы()
         подготовить(base, head)
-        файлы, добавленные = дифф(base, head)
+        файлы, добавленные, файлы_добавленных = дифф(base, head)
     except Exception as e:                                   # отказ по умолчанию
         print(f"барьер НЕ состоялся: {e}", file=sys.stderr)
         return 1
@@ -198,7 +259,9 @@ def main():
     if not ids:
         print("принципал петли НЕ объявлен: судейские пути закрыты для всех, "
               "остальное опознаётся только по имени ветки")
-    код, отчёт = проверить(файлы, добавленные, петля, принципалы_известны=bool(ids))
+    код, отчёт = проверить(файлы, добавленные, петля,
+                           файлы_добавленных=файлы_добавленных,
+                           принципалы_известны=bool(ids))
     for строка in отчёт:
         print(строка)
     return код
@@ -306,7 +369,7 @@ def selftest():
 
         подготовить(base, head, cwd=_раб)
         check("объекты по хешам достижимы", True)
-        файлы, добавленные = дифф(base, head, cwd=_раб)
+        файлы, добавленные, _ = дифф(base, head, cwd=_раб)
         check("дифф видит добавленный файл", файлы == ["b.py"])
         check("дифф видит добавленную строку", any("noqa" in s2 for s2 in добавленные))
         код, _ = проверить(файлы, добавленные, True)
@@ -328,6 +391,61 @@ def selftest():
             check("ненулевой код git — отказ, а не пустой ответ", False)
         except RuntimeError:
             check("ненулевой код git — отказ, а не пустой ответ", True)
+
+        # Путь с не-ASCII именем под судейским каталогом: без `-z` git отдавал его
+        # в кавычках с восьмеричными escape, и шаблон `^\.github/workflows/` молчал.
+        subprocess.run(["git", "config", "core.quotePath", "true"], cwd=_раб, check=True)
+        os.makedirs(os.path.join(_раб, ".github", "workflows"), exist_ok=True)
+        кавычки = os.path.join(".github", "workflows", "проверка\tвкладка.yml")
+        open(os.path.join(_раб, кавычки), "w").write("on: push\n")
+        subprocess.run(["git", "add", "-A"], cwd=_раб, check=True)
+        subprocess.run(["git", "commit", "-qm", "судья под кириллицей"], cwd=_раб, check=True)
+        head2 = git("rev-parse", "HEAD", cwd=_раб).strip()
+        сырой = git("diff", "--name-only", f"{head}...{head2}", cwd=_раб).strip()
+        check("фикстура честная: без -z git правда печатает путь в кавычках",
+              сырой.startswith('"') and судейский(сырой) is None)
+        файлы, добавленные, _ = дифф(head, head2, cwd=_раб)
+        check("путь с кириллицей и табуляцией читается дословно",
+              файлы == [".github/workflows/проверка\tвкладка.yml"])
+        код, _ = проверить(файлы, добавленные, True)
+        check("правка судьи под не-ASCII именем на ветке петли отвергается", код == 1)
+
+        # Переименование уводит судейский файл из-под шаблона: оба имени обязаны
+        # попасть в список, иначе видно только безобидное новое.
+        subprocess.run(["git", "mv", кавычки, "docs-вынесено.yml"], cwd=_раб, check=True)
+        subprocess.run(["git", "commit", "-qm", "вынос"], cwd=_раб, check=True)
+        head3 = git("rev-parse", "HEAD", cwd=_раб).strip()
+        файлы, добавленные, _ = дифф(head2, head3, cwd=_раб)
+        check("переименование называет и старый, и новый путь",
+              sorted(файлы) == sorted([".github/workflows/проверка\tвкладка.yml",
+                                       "docs-вынесено.yml"]))
+        код, _ = проверить(файлы, добавленные, True)
+        check("вынос судейского файла переименованием на ветке петли отвергается",
+              код == 1)
+
+        # Сквозной прогон main(): раньше main() не передавал проверить() пути строк,
+        # и проверка не-ASCII буквы в коде в бою не исполнялась вовсе — её звал
+        # только самотест со списком, собранным руками.
+        open(os.path.join(_раб, "омоглиф.py"), "w", encoding="utf-8").write("x = ο\n")
+        open(os.path.join(_раб, "плюсы.txt"), "w").write("++x\n")
+        subprocess.run(["git", "add", "-A"], cwd=_раб, check=True)
+        subprocess.run(["git", "commit", "-qm", "омоглиф"], cwd=_раб, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "HEAD:тема-омоглиф"], cwd=_раб,
+                       check=True)
+        head4 = git("rev-parse", "HEAD", cwd=_раб).strip()
+        файлы, добавленные, пары = дифф(head3, head4, cwd=_раб)
+        check("дифф привязывает строку к её файлу", ("омоглиф.py", "x = ο") in пары)
+        check("строка «++x» не теряется как заголовок", "++x" in добавленные)
+        окружение = dict(os.environ, BASE_SHA=head3, HEAD_SHA=head4,
+                         HEAD_REF="einar-fix/омоглиф", PR_AUTHOR_ID="", PR_AUTHOR_LOGIN="t")
+        r = subprocess.run([sys.executable, os.path.abspath(__file__)], cwd=_раб,
+                           env=окружение, capture_output=True, text=True, timeout=120)
+        check("main() ловит не-ASCII букву в коде на ветке петли (выход 1)",
+              r.returncode == 1 and "не-ASCII буква" in r.stdout)
+        окружение["HEAD_REF"] = "человек/правка"
+        r = subprocess.run([sys.executable, os.path.abspath(__file__)], cwd=_раб,
+                           env=окружение, capture_output=True, text=True, timeout=120)
+        check("тот же дифф вне петли main() пропускает (выход 0)", r.returncode == 0)
     finally:
         _sh.rmtree(_корень, ignore_errors=True)
 
